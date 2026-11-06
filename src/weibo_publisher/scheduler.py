@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import inspect
+import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.base import SchedulerNotRunningError
 
 from weibo_publisher.config import AppConfig
 from weibo_publisher.models import (
@@ -16,6 +22,12 @@ from weibo_publisher.models import (
 from weibo_publisher.publisher import Publisher
 from weibo_publisher.repository import JobRepository
 from weibo_publisher.validation import build_fingerprint, validate_images
+
+SCAN_INTERVAL_SECONDS = 5
+
+
+class RunnerLockError(RuntimeError):
+    pass
 
 
 class JobExecutor:
@@ -252,3 +264,174 @@ class JobExecutor:
                 AttemptOutcome.FAILED.value,
                 result.error,
             )
+
+
+class Runner:
+    def __init__(
+        self,
+        config: AppConfig,
+        repo: JobRepository,
+        publisher_factory: Callable[[], Publisher],
+        executor_factory: Callable[[str], object] | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        self.config = config
+        self.repo = repo
+        self.publisher_factory = publisher_factory
+        self.executor_factory = executor_factory
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.sleep = sleep or asyncio.sleep
+        self.scheduler = AsyncIOScheduler(timezone=config.default_timezone)
+        self._scheduled_job_ids: set[str] = set()
+        self.scheduled = self._scheduled_job_ids
+        self._lock_path = config.runtime_dir / "runner.lock"
+        self._lock_fd: int | None = None
+
+    def acquire_lock(self) -> None:
+        self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            lock_fd = os.open(
+                self._lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError as exc:
+            raise RunnerLockError(
+                f"Another runner is already running for {self.config.root}"
+            ) from exc
+        self._lock_fd = lock_fd
+        try:
+            os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
+        except BaseException:
+            self.release_lock()
+            raise
+
+    def release_lock(self) -> None:
+        lock_fd = self._lock_fd
+        if lock_fd is None:
+            return
+        self._lock_fd = None
+        try:
+            os.close(lock_fd)
+        finally:
+            self._lock_path.unlink(missing_ok=True)
+
+    async def scan_once(self) -> None:
+        approved_jobs = {
+            job.id: job for job in self.repo.list_jobs(JobStatus.APPROVED)
+        }
+        self._remove_inactive_jobs(approved_jobs)
+
+        now = self._now()
+        for job in approved_jobs.values():
+            if job.id in self._scheduled_job_ids:
+                continue
+
+            cutoff = job.publish_at_utc + timedelta(
+                seconds=self.config.late_cutoff_seconds
+            )
+            if now > cutoff:
+                self.repo.transition(
+                    job.id,
+                    {JobStatus.APPROVED},
+                    JobStatus.MISSED,
+                    last_error="Job was too late to prepare safely",
+                )
+                continue
+
+            prepare_at = job.publish_at_utc - timedelta(
+                seconds=self.config.prepare_lead_seconds
+            )
+            run_at = max(
+                now + timedelta(seconds=SCAN_INTERVAL_SECONDS),
+                prepare_at,
+            )
+            self.scheduler.add_job(
+                self._executor(job.id),
+                "date",
+                run_date=run_at,
+                id=self._scheduler_job_id(job.id),
+                replace_existing=True,
+            )
+            self._scheduled_job_ids.add(job.id)
+
+    async def recover_interrupted(self) -> None:
+        for job in self.repo.list_jobs(JobStatus.PUBLISHING):
+            self.repo.transition(
+                job.id,
+                {JobStatus.PUBLISHING},
+                JobStatus.UNKNOWN,
+                last_error="Runner restarted during submission",
+            )
+
+        message = (
+            "Runner restarted after browser preparation; "
+            "the in-memory browser context was lost"
+        )
+        for status in (JobStatus.PREPARING, JobStatus.READY):
+            for job in self.repo.list_jobs(status):
+                self.repo.transition(
+                    job.id,
+                    {status},
+                    JobStatus.NEEDS_ATTENTION,
+                    last_error=message,
+                )
+
+    async def run_forever(
+        self,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        self.acquire_lock()
+        try:
+            await self.recover_interrupted()
+            self.scheduler.start()
+            while stop_event is None or not stop_event.is_set():
+                await self.scan_once()
+                await self.sleep(SCAN_INTERVAL_SECONDS)
+        finally:
+            try:
+                self.scheduler.shutdown(wait=False)
+            except SchedulerNotRunningError:
+                pass
+            else:
+                await asyncio.sleep(0)
+            self.release_lock()
+
+    def _remove_inactive_jobs(self, approved_jobs: dict[str, Job]) -> None:
+        for job_id in list(self._scheduled_job_ids):
+            if job_id in approved_jobs:
+                continue
+            try:
+                self.scheduler.remove_job(self._scheduler_job_id(job_id))
+            except JobLookupError:
+                pass
+            self._scheduled_job_ids.discard(job_id)
+
+    def _executor(self, job_id: str) -> Callable[[], Awaitable[None]]:
+        if self.executor_factory is not None:
+
+            async def injected() -> None:
+                callback = self.executor_factory(job_id)
+                if inspect.isawaitable(callback):
+                    await callback
+
+            return injected
+
+        executor = JobExecutor(
+            self.config,
+            self.repo,
+            self.publisher_factory,
+        )
+        return lambda: executor.execute(job_id)
+
+    def _now(self) -> datetime:
+        now = self.clock()
+        if now.tzinfo is None:
+            return now.replace(tzinfo=UTC)
+        return now.astimezone(UTC)
+
+    def _scheduler_job_id(self, job_id: str) -> str:
+        return f"job:{job_id}"

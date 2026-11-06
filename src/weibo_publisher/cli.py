@@ -12,6 +12,7 @@ from weibo_publisher.config import ensure_runtime_dirs, load_config
 from weibo_publisher.logging_setup import configure_logging
 from weibo_publisher.models import Job, JobStatus, Visibility
 from weibo_publisher.repository import JobRepository
+from weibo_publisher.scheduler import Runner, RunnerLockError
 from weibo_publisher.validation import (
     build_fingerprint,
     normalize_text,
@@ -82,6 +83,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fill a draft or approved job in Weibo without publishing.",
     )
     preview.add_argument("job_id")
+
+    subparsers.add_parser(
+        "run",
+        help="Start the single-runner publishing scheduler.",
+    )
 
     return parser
 
@@ -357,6 +363,34 @@ def _cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    repo, config = _repository_from_args(args)
+    configure_logging(config)
+    from weibo_publisher.weibo import WeiboPublisher
+
+    runner = Runner(
+        config,
+        repo,
+        lambda: WeiboPublisher(config),
+    )
+    print("Runner started. Press Ctrl+C to stop.")
+    try:
+        asyncio.run(runner.run_forever())
+    except RunnerLockError as exc:
+        print(f"error: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("Runner stopped.")
+        return 0
+    except Exception:
+        logging.getLogger(__name__).exception("Runner stopped unexpectedly")
+        print("error: runner stopped unexpectedly")
+        return 1
+
+    print("Runner stopped.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -370,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         "cancel": _cmd_cancel,
         "status": _cmd_status,
         "preview": _cmd_preview,
+        "run": _cmd_run,
     }
     return handlers[args.command](args)
 

@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +15,7 @@ from weibo_publisher.models import (
     Visibility,
 )
 from weibo_publisher.repository import JobRepository
-from weibo_publisher.scheduler import JobExecutor
+from weibo_publisher.scheduler import JobExecutor, Runner, RunnerLockError
 from weibo_publisher.validation import build_fingerprint
 
 
@@ -544,3 +545,247 @@ async def test_non_approved_job_is_ignored(
     assert loaded.last_attempt_at is None
     assert factory_calls == 0
     assert repo.list_attempts("job-1") == []
+
+
+@pytest.mark.asyncio
+async def test_scan_ignores_draft_jobs(app_config: AppConfig) -> None:
+    job = approved_job()
+    job.status = JobStatus.DRAFT
+    repo = repository_with(app_config, job)
+    calls: list[str] = []
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=lambda job_id: calls.append(job_id),
+    )
+
+    await runner.scan_once()
+
+    assert calls == []
+    assert runner.scheduled == set()
+    assert runner.scheduler.timezone.key == app_config.default_timezone
+
+
+@pytest.mark.asyncio
+async def test_scan_schedules_approved_job_once(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config, approved_job(seconds_from_now=10))
+    added: list[dict[str, object]] = []
+
+    def record_add_job(callback, trigger, **kwargs) -> None:
+        added.append(
+            {
+                "callback": callback,
+                "trigger": trigger,
+                **kwargs,
+            }
+        )
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=lambda job_id: None,
+    )
+    monkeypatch.setattr(runner.scheduler, "add_job", record_add_job)
+
+    await runner.scan_once()
+    await runner.scan_once()
+
+    assert runner.scheduled == {"job-1"}
+    assert len(added) == 1
+    assert added[0]["id"] == "job:job-1"
+    assert added[0]["trigger"] == "date"
+    run_date = added[0]["run_date"]
+    assert isinstance(run_date, datetime)
+    assert timedelta(seconds=4) <= run_date - datetime.now(UTC) <= timedelta(seconds=6)
+
+
+@pytest.mark.asyncio
+async def test_scan_uses_prepare_lead_for_future_job(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock_now = datetime.now(UTC)
+    job = approved_job_at(clock_now + timedelta(seconds=600))
+    repo = repository_with(app_config, job)
+    added: dict[str, object] = {}
+
+    def record_add_job(callback, trigger, **kwargs) -> None:
+        added.update({"callback": callback, "trigger": trigger, **kwargs})
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=lambda job_id: None,
+        clock=lambda: clock_now,
+    )
+    monkeypatch.setattr(runner.scheduler, "add_job", record_add_job)
+
+    await runner.scan_once()
+
+    assert added["run_date"] == job.publish_at_utc - timedelta(
+        seconds=app_config.prepare_lead_seconds
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_marks_late_approved_job_missed(app_config: AppConfig) -> None:
+    repo = repository_with(app_config, approved_job(seconds_from_now=-31))
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=lambda job_id: None,
+    )
+
+    await runner.scan_once()
+
+    job = repo.get_job("job-1")
+    assert job is not None
+    assert job.status is JobStatus.MISSED
+    assert job.last_error is not None
+    assert "late" in job.last_error.lower()
+    assert runner.scheduled == set()
+
+
+@pytest.mark.asyncio
+async def test_scan_removes_job_that_is_no_longer_approved(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config, approved_job(seconds_from_now=600))
+    removed: list[str] = []
+
+    def record_add_job(callback, trigger, **kwargs) -> None:
+        del callback, trigger, kwargs
+
+    def record_remove_job(job_id: str) -> None:
+        removed.append(job_id)
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=lambda job_id: None,
+    )
+    monkeypatch.setattr(runner.scheduler, "add_job", record_add_job)
+    monkeypatch.setattr(runner.scheduler, "remove_job", record_remove_job)
+
+    await runner.scan_once()
+    assert repo.transition(
+        "job-1",
+        {JobStatus.APPROVED},
+        JobStatus.CANCELLED,
+    )
+
+    await runner.scan_once()
+
+    assert runner.scheduled == set()
+    assert removed == ["job:job-1"]
+
+
+@pytest.mark.asyncio
+async def test_runner_lock_refuses_second_runner(app_config: AppConfig) -> None:
+    repo = repository_with(app_config)
+    first = Runner(app_config, repo, lambda: FakePublisher())
+    second = Runner(app_config, repo, lambda: FakePublisher())
+    first.acquire_lock()
+    try:
+        with pytest.raises(RunnerLockError, match="already running"):
+            second.acquire_lock()
+    finally:
+        first.release_lock()
+
+    assert not (app_config.runtime_dir / "runner.lock").exists()
+
+
+@pytest.mark.asyncio
+async def test_runner_releases_lock_on_normal_exit(app_config: AppConfig) -> None:
+    repo = repository_with(app_config)
+    runner = Runner(app_config, repo, lambda: FakePublisher())
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await runner.run_forever(stop_event=stop_event)
+
+    assert not (app_config.runtime_dir / "runner.lock").exists()
+    assert runner.scheduler.state == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_releases_lock_when_loop_raises(app_config: AppConfig) -> None:
+    repo = repository_with(app_config)
+
+    async def fail_sleep(delay: float) -> None:
+        assert delay == 5
+        raise RuntimeError("stop after first scan")
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        sleep=fail_sleep,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after first scan"):
+        await runner.run_forever()
+
+    assert not (app_config.runtime_dir / "runner.lock").exists()
+    assert runner.scheduler.state == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_marks_interrupted_jobs_for_attention(
+    app_config: AppConfig,
+) -> None:
+    publishing = approved_job()
+    publishing.id = "publishing"
+    publishing.status = JobStatus.PUBLISHING
+    preparing = approved_job(seconds_from_now=600)
+    preparing.id = "preparing"
+    preparing.status = JobStatus.PREPARING
+    ready = approved_job(seconds_from_now=600)
+    ready.id = "ready"
+    ready.status = JobStatus.READY
+    repo = repository_with(app_config, publishing, preparing, ready)
+    runner = Runner(app_config, repo, lambda: FakePublisher())
+
+    await runner.recover_interrupted()
+
+    recovered_publishing = repo.get_job("publishing")
+    recovered_preparing = repo.get_job("preparing")
+    recovered_ready = repo.get_job("ready")
+    assert recovered_publishing is not None
+    assert recovered_publishing.status is JobStatus.UNKNOWN
+    assert recovered_publishing.last_error == "Runner restarted during submission"
+    assert recovered_preparing is not None
+    assert recovered_preparing.status is JobStatus.NEEDS_ATTENTION
+    assert recovered_preparing.last_error is not None
+    assert "browser context" in recovered_preparing.last_error.lower()
+    assert recovered_ready is not None
+    assert recovered_ready.status is JobStatus.NEEDS_ATTENTION
+    assert recovered_ready.last_error is not None
+    assert "browser context" in recovered_ready.last_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_forever_recovers_before_exiting(app_config: AppConfig) -> None:
+    publishing = approved_job()
+    publishing.id = "publishing"
+    publishing.status = JobStatus.PUBLISHING
+    repo = repository_with(app_config, publishing)
+    runner = Runner(app_config, repo, lambda: FakePublisher())
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await runner.run_forever(stop_event=stop_event)
+
+    job = repo.get_job("publishing")
+    assert job is not None
+    assert job.status is JobStatus.UNKNOWN

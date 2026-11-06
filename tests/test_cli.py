@@ -2,10 +2,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from weibo_publisher.cli import main
 from weibo_publisher.config import ensure_runtime_dirs, load_config
 from weibo_publisher.models import Job, JobStatus, Visibility
 from weibo_publisher.repository import JobRepository
+from weibo_publisher.scheduler import RunnerLockError
 
 
 def _write_config(root: Path, **overrides: str) -> None:
@@ -324,3 +327,32 @@ def test_status_shows_artifact_path(tmp_path: Path, monkeypatch, capsys) -> None
 
     assert main(["status", draft.id]) == 0
     assert "Artifact" in capsys.readouterr().out
+
+
+def test_run_reports_startup_and_lock_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    calls: list[str] = []
+
+    class FakeRunner:
+        def __init__(self, config, repo, publisher_factory) -> None:
+            del config, repo, publisher_factory
+
+        async def run_forever(self) -> None:
+            calls.append("run")
+
+    class BlockedRunner(FakeRunner):
+        async def run_forever(self) -> None:
+            raise RunnerLockError("runner is already running")
+
+    monkeypatch.setattr("weibo_publisher.cli.Runner", FakeRunner)
+    assert main(["run"]) == 0
+    assert calls == ["run"]
+    assert "Runner started" in capsys.readouterr().out
+
+    monkeypatch.setattr("weibo_publisher.cli.Runner", BlockedRunner)
+    assert main(["run"]) == 1
+    assert "already running" in capsys.readouterr().out
