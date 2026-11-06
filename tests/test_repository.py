@@ -1,9 +1,12 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
+import weibo_publisher.repository as repository_module
 from weibo_publisher.models import Job, JobStatus, Visibility
 from weibo_publisher.repository import JobRepository
 
@@ -235,3 +238,135 @@ def test_record_and_finish_attempt(tmp_path: Path) -> None:
     assert datetime.fromisoformat(finished_at).tzinfo is UTC
     assert outcome == "success"
     assert error is None
+
+
+def test_finish_open_attempts_only_updates_pending_rows(tmp_path: Path) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+    repo.initialize()
+    repo.create_job(make_job())
+    repo.record_attempt("job-1", "pending")
+    repo.record_attempt("job-1", "finished")
+    repo.finish_attempt("finished", "success", None)
+
+    changed = repo.finish_open_attempts(
+        "job-1",
+        "interrupted",
+        "Runner restarted",
+    )
+
+    attempts = {attempt["attempt_id"]: attempt for attempt in repo.list_attempts("job-1")}
+    assert changed == 1
+    assert attempts["pending"]["outcome"] == "interrupted"
+    assert attempts["pending"]["error"] == "Runner restarted"
+    assert attempts["pending"]["finished_at"] is not None
+    assert attempts["finished"]["outcome"] == "success"
+    assert attempts["finished"]["error"] is None
+
+
+def test_confirmation_rejects_followers_visibility_atomically(tmp_path: Path) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+    repo.initialize()
+    job = make_job()
+    job.visibility = Visibility.FOLLOWERS
+    repo.create_job(job)
+
+    with pytest.raises(
+        repository_module.ConfirmationError,
+        match="followers visibility is not supported yet",
+    ):
+        repo.confirm_job(
+            "job-1",
+            "confirmed-fingerprint",
+            datetime(2026, 11, 6, 9, 0, tzinfo=UTC),
+            daily_limit=100,
+            minimum_gap_seconds=240,
+            allow_over_limit=False,
+        )
+
+    loaded = repo.get_job("job-1")
+    assert loaded is not None
+    assert loaded.status is JobStatus.DRAFT
+    assert loaded.fingerprint == ""
+
+
+def test_confirmation_is_atomic_for_daily_limit(tmp_path: Path) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+    repo.initialize()
+    first = make_job()
+    second = make_job()
+    second.id = "job-2"
+    second.publish_at_utc = datetime(2026, 11, 7, 10, 30, tzinfo=UTC)
+    repo.create_job(first)
+    repo.create_job(second)
+
+    results = _confirm_concurrently(
+        repo,
+        ("job-1", "job-2"),
+        daily_limit=1,
+        minimum_gap_seconds=240,
+    )
+
+    assert sorted(error for _, error in results if error is not None) == [
+        "daily limit reached"
+    ]
+    approved_ids = _approved_ids(repo, "job-1", "job-2")
+    assert len(approved_ids) == 1
+
+
+def test_confirmation_is_atomic_for_minimum_gap(tmp_path: Path) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+    repo.initialize()
+    first = make_job()
+    second = make_job()
+    second.id = "job-2"
+    repo.create_job(first)
+    repo.create_job(second)
+
+    results = _confirm_concurrently(
+        repo,
+        ("job-1", "job-2"),
+        daily_limit=100,
+        minimum_gap_seconds=240,
+    )
+
+    failures = [error for _, error in results if error is not None]
+    assert len(failures) == 1
+    assert failures[0] is not None and "within minimum gap" in failures[0]
+    assert len(_approved_ids(repo, "job-1", "job-2")) == 1
+
+
+def _confirm_concurrently(
+    repo: JobRepository,
+    job_ids: tuple[str, ...],
+    *,
+    daily_limit: int,
+    minimum_gap_seconds: int,
+) -> list[tuple[str, str | None]]:
+    barrier = Barrier(len(job_ids))
+
+    def confirm(job_id: str) -> tuple[str, str | None]:
+        barrier.wait()
+        try:
+            repo.confirm_job(
+                job_id,
+                f"fingerprint-{job_id}",
+                datetime(2026, 11, 6, 9, 0, tzinfo=UTC),
+                daily_limit=daily_limit,
+                minimum_gap_seconds=minimum_gap_seconds,
+                allow_over_limit=False,
+            )
+        except repository_module.ConfirmationError as exc:
+            return job_id, str(exc)
+        return job_id, None
+
+    with ThreadPoolExecutor(max_workers=len(job_ids)) as pool:
+        return list(pool.map(confirm, job_ids))
+
+
+def _approved_ids(repo: JobRepository, *job_ids: str) -> list[str]:
+    approved: list[str] = []
+    for job_id in job_ids:
+        job = repo.get_job(job_id)
+        if job is not None and job.status is JobStatus.APPROVED:
+            approved.append(job.id)
+    return approved

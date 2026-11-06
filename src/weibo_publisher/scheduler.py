@@ -19,6 +19,7 @@ from weibo_publisher.models import (
     Job,
     JobStatus,
     PublishResult,
+    Visibility,
 )
 from weibo_publisher.publisher import Publisher
 from weibo_publisher.repository import JobRepository
@@ -52,22 +53,27 @@ class JobExecutor:
             seconds=self.config.late_cutoff_seconds
         )
         now = datetime.now(UTC)
-        if now > cutoff:
+        if now >= job.publish_at_utc:
             self.repo.transition(
                 job_id,
                 {JobStatus.APPROVED},
                 JobStatus.MISSED,
-                last_error="Job was too late to publish safely",
+                last_error=(
+                    "Job was too late: target time passed before preparation started"
+                ),
             )
             return
 
         started_at = datetime.now(UTC)
+        attempt_id = uuid4().hex
+        artifact_dir = self.config.artifacts_dir / job_id / attempt_id
         if not self.repo.transition(
             job_id,
             {JobStatus.APPROVED},
             JobStatus.PREPARING,
             last_attempt_at=started_at,
             last_error=None,
+            artifact_dir=artifact_dir,
         ):
             return
 
@@ -82,8 +88,6 @@ class JobExecutor:
             )
             return
 
-        attempt_id = uuid4().hex
-        artifact_dir = self.config.artifacts_dir / job_id / attempt_id
         publisher: Publisher | None = None
         attempt_recorded = False
         submit_started = False
@@ -175,12 +179,18 @@ class JobExecutor:
                 )
                 outcome = AttemptOutcome.UNKNOWN
             else:
-                self.repo.transition(
+                if not self.repo.transition(
                     job_id,
-                    {JobStatus.PREPARING, JobStatus.READY},
+                    {JobStatus.PREPARING},
                     JobStatus.FAILED,
                     last_error=str(exc),
-                )
+                ):
+                    self.repo.transition(
+                        job_id,
+                        {JobStatus.READY},
+                        JobStatus.NEEDS_ATTENTION,
+                        last_error=str(exc),
+                    )
                 outcome = AttemptOutcome.FAILED
             if attempt_recorded:
                 self.repo.finish_attempt(attempt_id, outcome.value, str(exc))
@@ -189,6 +199,11 @@ class JobExecutor:
                 await publisher.close()
 
     def _validate_preparation(self, job: Job) -> None:
+        if job.visibility is not Visibility.PUBLIC:
+            raise ValueError(
+                "Only public visibility is supported for automatic publishing"
+            )
+
         images = validate_images(job.images)
         fingerprint = build_fingerprint(
             job.text,
@@ -381,15 +396,14 @@ class Runner:
             if job.id in self._scheduled_job_ids:
                 continue
 
-            cutoff = job.publish_at_utc + timedelta(
-                seconds=self.config.late_cutoff_seconds
-            )
-            if now > cutoff:
+            if now >= job.publish_at_utc:
                 self.repo.transition(
                     job.id,
                     {JobStatus.APPROVED},
                     JobStatus.MISSED,
-                    last_error="Job was too late to prepare safely",
+                    last_error=(
+                        "Job was too late: target time passed before preparation started"
+                    ),
                 )
                 continue
 
@@ -410,12 +424,18 @@ class Runner:
             self._scheduled_job_ids.add(job.id)
 
     async def recover_interrupted(self) -> None:
+        publishing_error = "Runner restarted during submission"
         for job in self.repo.list_jobs(JobStatus.PUBLISHING):
             self.repo.transition(
                 job.id,
                 {JobStatus.PUBLISHING},
                 JobStatus.UNKNOWN,
-                last_error="Runner restarted during submission",
+                last_error=publishing_error,
+            )
+            self.repo.finish_open_attempts(
+                job.id,
+                AttemptOutcome.UNKNOWN.value,
+                publishing_error,
             )
 
         message = (
@@ -429,6 +449,11 @@ class Runner:
                     {status},
                     JobStatus.NEEDS_ATTENTION,
                     last_error=message,
+                )
+                self.repo.finish_open_attempts(
+                    job.id,
+                    AttemptOutcome.INTERRUPTED.value,
+                    message,
                 )
 
     async def run_forever(
@@ -473,9 +498,12 @@ class Runner:
         if self.executor_factory is not None:
 
             async def injected() -> None:
-                callback = self.executor_factory(job_id)
-                if inspect.isawaitable(callback):
-                    await callback
+                try:
+                    callback = self.executor_factory(job_id)
+                    if inspect.isawaitable(callback):
+                        await callback
+                finally:
+                    self._scheduled_job_ids.discard(job_id)
 
             return injected
 
@@ -486,7 +514,10 @@ class Runner:
         )
 
         async def execute_job() -> None:
-            await executor.execute(job_id)
+            try:
+                await executor.execute(job_id)
+            finally:
+                self._scheduled_job_ids.discard(job_id)
 
         return execute_job
 

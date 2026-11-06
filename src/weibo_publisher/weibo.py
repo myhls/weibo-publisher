@@ -14,8 +14,8 @@ from weibo_publisher.browser import (
     persistent_context,
 )
 from weibo_publisher.config import AppConfig
-from weibo_publisher.models import AttemptOutcome, Job, PublishResult
-from weibo_publisher.validation import validate_images
+from weibo_publisher.models import AttemptOutcome, Job, PublishResult, Visibility
+from weibo_publisher.validation import normalize_text, validate_images
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, Locator, Page
@@ -35,10 +35,20 @@ PUBLISH_SELECTORS = [
     'a:has-text("发布")',
     '[class*="submit"]:has-text("发布")',
 ]
+VISIBILITY_SELECTORS = [
+    '[data-testid="visibility"]',
+    '[data-visibility]',
+    '[aria-label*="可见"]',
+    'button:has-text("公开")',
+    'button:has-text("粉丝")',
+    '[class*="visibility"]',
+]
 
 _UPLOAD_INDICATOR_SELECTORS = (
     '[class*="upload"][class*="progress"]',
     '[class*="uploading"]',
+    '[data-upload-state="uploading"]',
+    '[class*="upload"] [aria-busy="true"]',
     '[class*="upload"] [class*="loading"]',
     '[class*="pic_add"] [class*="loading"]',
 )
@@ -46,6 +56,7 @@ _UPLOAD_TIMEOUT_SECONDS = 5.0
 _UPLOAD_POLL_INTERVAL_SECONDS = 0.1
 _PUBLISH_RESPONSE_TIMEOUT_MS = 30_000
 _PUBLISH_ENDPOINT = "/ajax/statuses/update"
+_PUBLIC_VISIBILITY_LABELS = frozenset({"公开", "公开可见", "所有人可见"})
 
 
 class WeiboPublisher:
@@ -54,6 +65,7 @@ class WeiboPublisher:
         self.page: Page | None = None
         self._context: BrowserContext | None = None
         self._exit_stack: AsyncExitStack | None = None
+        self._prepared_state: tuple[str, tuple[str, ...], Visibility] | None = None
 
     async def prepare(self, job: Job, artifact_dir: Path) -> None:
         if self._exit_stack is not None:
@@ -70,6 +82,11 @@ class WeiboPublisher:
             self._context = context
             self.page = context.pages[0] if context.pages else await context.new_page()
             await _prepare_page(self.page, job.text, images, artifact_dir)
+            self._prepared_state = (
+                normalize_text(job.text),
+                tuple(str(image) for image in images),
+                job.visibility,
+            )
         except BaseException:
             await self.close()
             raise
@@ -77,10 +94,33 @@ class WeiboPublisher:
     async def submit(self, job: Job, artifact_dir: Path) -> PublishResult:
         if self.page is None:
             raise RuntimeError("Weibo publisher has not been prepared")
-        del job
 
         page = self.page
-        button = await first_visible(page, PUBLISH_SELECTORS)
+        try:
+            images = validate_images(job.images)
+            if job.visibility is not Visibility.PUBLIC:
+                raise RuntimeError("followers visibility is not supported yet")
+            expected_state = (
+                normalize_text(job.text),
+                tuple(str(image) for image in images),
+                job.visibility,
+            )
+            if self._prepared_state != expected_state:
+                raise RuntimeError(
+                    "submit job does not match the prepared composer state"
+                )
+            await _validate_submit_page(page, job)
+            button = await first_visible(page, PUBLISH_SELECTORS)
+        except Exception as exc:  # noqa: BLE001 - pre-click failures are definite
+            await _screenshot_safely(
+                page,
+                artifact_dir / "submit-validation-failed.png",
+            )
+            return PublishResult(
+                outcome=AttemptOutcome.FAILED,
+                error=f"Pre-submit validation failed: {exc}",
+            )
+
         try:
             async with page.expect_response(
                 lambda response: (
@@ -113,6 +153,7 @@ class WeiboPublisher:
         self._exit_stack = None
         self._context = None
         self.page = None
+        self._prepared_state = None
         if exit_stack is not None:
             await exit_stack.aclose()
 
@@ -238,8 +279,71 @@ async def _wait_for_uploads(page: Page) -> None:
     while await _has_visible_indicator(page):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return
+            raise RuntimeError("Image upload did not complete before timeout")
         await asyncio.sleep(min(_UPLOAD_POLL_INTERVAL_SECONDS, remaining))
+
+
+async def _validate_submit_page(page: Page, job: Job) -> None:
+    composer = await first_visible(page, TEXT_SELECTORS)
+    composer_text = await _read_composer_text(composer)
+    if normalize_text(composer_text) != normalize_text(job.text):
+        raise RuntimeError("composer text does not match the prepared job")
+
+    expected_images = len(job.images)
+    attached_images = await _attached_file_count(page)
+    if attached_images != expected_images:
+        raise RuntimeError(
+            f"expected {expected_images} attached image(s), "
+            f"found {attached_images}"
+        )
+
+    if await _has_visible_indicator(page):
+        raise RuntimeError("image upload has not completed")
+
+    visibility_label = await _read_visibility_label(page)
+    if visibility_label is None:
+        raise RuntimeError("visibility could not be verified before submit")
+    if visibility_label not in _PUBLIC_VISIBILITY_LABELS:
+        raise RuntimeError(f"visibility is not public: {visibility_label}")
+
+
+async def _read_composer_text(composer: Locator) -> str:
+    tag_name = await composer.evaluate(
+        "(element) => element.tagName.toLowerCase()"
+    )
+    if tag_name == "textarea":
+        return await composer.input_value()
+    return await composer.text_content() or ""
+
+
+async def _attached_file_count(page: Page) -> int:
+    for selector in IMAGE_INPUT_SELECTORS:
+        locator = page.locator(selector)
+        if await locator.count():
+            return int(
+                await locator.first.evaluate(
+                    "(input) => input.files ? input.files.length : 0"
+                )
+            )
+    return 0
+
+
+async def _read_visibility_label(page: Page) -> str | None:
+    for selector in VISIBILITY_SELECTORS:
+        locator = page.locator(selector)
+        for index in range(await locator.count()):
+            candidate = locator.nth(index)
+            if not await candidate.is_visible():
+                continue
+            text = normalize_text(await candidate.inner_text())
+            if text:
+                return text
+            aria_label = normalize_text(
+                await candidate.get_attribute("aria-label") or ""
+            )
+            if aria_label:
+                return aria_label
+    return None
 
 
 async def _screenshot_safely(page: Page, path: Path) -> None:

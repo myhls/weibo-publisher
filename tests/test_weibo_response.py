@@ -154,6 +154,195 @@ async def test_submit_timeout_after_click_is_unknown_and_does_not_reclick(
     assert (artifact_dir / "submit-unknown.png").is_file()
 
 
+@pytest.mark.asyncio
+async def test_submit_text_drift_fails_before_click(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_dir = app_config.artifacts_dir / "job-text-drift"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"code": 100000, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.fill("#body", "changed after preparation")
+        result = await publisher.submit(_job(), artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error is not None and "composer text" in result.error
+    assert click_count == 0
+    assert observed["post_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_missing_image_attachment_fails_before_click(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nattached")
+    job = _job(images=[image])
+    artifact_dir = app_config.artifacts_dir / "job-missing-image"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"code": 100000, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.set_input_files("#image", [])
+        result = await publisher.submit(job, artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error is not None and "attached image" in result.error
+    assert click_count == 0
+    assert observed["post_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_unfinished_upload_fails_before_click(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nattached")
+    job = _job(images=[image])
+    artifact_dir = app_config.artifacts_dir / "job-uploading"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"code": 100000, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.evaluate(
+            """
+            () => {
+              const indicator = document.createElement("div");
+              indicator.className = "uploading";
+              indicator.textContent = "Uploading";
+              document.body.appendChild(indicator);
+            }
+            """
+        )
+        result = await publisher.submit(job, artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error is not None and "upload has not completed" in result.error
+    assert click_count == 0
+    assert observed["post_requests"] == 0
+
+
+@pytest.mark.parametrize(
+    ("visibility_label", "expected_error"),
+    [
+        ("仅粉丝可见", "visibility is not public"),
+        (None, "visibility could not be verified"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_submit_requires_verified_public_visibility(
+    visibility_label: str | None,
+    expected_error: str,
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_dir = app_config.artifacts_dir / "job-visibility"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"code": 100000, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+    )
+
+    try:
+        assert publisher.page is not None
+        visibility = publisher.page.locator("#visibility")
+        if visibility_label is None:
+            await visibility.evaluate("element => element.remove()")
+        else:
+            await visibility.evaluate(
+                """
+                (element, label) => {
+                  element.textContent = label;
+                  element.setAttribute("aria-label", label);
+                }
+                """,
+                visibility_label,
+            )
+        result = await publisher.submit(_job(), artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error is not None and expected_error in result.error
+    assert click_count == 0
+    assert observed["post_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_revalidates_image_and_public_visibility_before_one_click(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nattached")
+    job = _job(images=[image])
+    artifact_dir = app_config.artifacts_dir / "job-revalidated"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"code": 100000, "data": {"idstr": "456"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        result = await publisher.submit(job, artifact_dir)
+        assert publisher.page is not None
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.SUCCESS
+    assert result.weibo_mid == "456"
+    assert click_count == 1
+    assert observed["post_requests"] == 1
+
+
 async def _submit_with_response(
     app_config: AppConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -193,6 +382,7 @@ async def _prepared_publisher(
     *,
     response_payload: dict[str, Any] | None,
     artifact_dir: Path,
+    job: Job | None = None,
 ) -> tuple[WeiboPublisher, dict[str, int]]:
     observed = {"post_requests": 0}
     monkeypatch.setattr(
@@ -201,7 +391,7 @@ async def _prepared_publisher(
         _routed_context_factory(response_payload, observed),
     )
     publisher = WeiboPublisher(_local_config(app_config))
-    await publisher.prepare(_job(), artifact_dir)
+    await publisher.prepare(job or _job(), artifact_dir)
     return publisher, observed
 
 
@@ -245,6 +435,8 @@ def _page_html(*, sends_post: bool) -> str:
         <header><a class="gn_name" href="/u/123">Account</a></header>
         <main>
           <textarea id="body" placeholder="分享新鲜事"></textarea>
+          <input id="image" type="file" accept="image/*" multiple style="display:none">
+          <button id="visibility" type="button" aria-label="公开可见">公开可见</button>
           <button id="publish" type="button">发布</button>
         </main>
         <script>
@@ -291,11 +483,11 @@ def _local_config(config: AppConfig) -> AppConfig:
     return replace(config, browser_channel="", headless=True)
 
 
-def _job() -> Job:
+def _job(*, images: list[Path] | None = None) -> Job:
     return Job(
         id="job-submit",
         text="submit test",
-        images=[],
+        images=images or [],
         publish_at_utc=datetime.now(UTC) + timedelta(days=1),
         timezone="Asia/Shanghai",
         visibility=Visibility.PUBLIC,

@@ -233,6 +233,22 @@ async def test_late_job_is_missed_without_creating_publisher(
 
 
 @pytest.mark.asyncio
+async def test_approved_job_is_missed_once_target_time_has_arrived(
+    app_config: AppConfig,
+) -> None:
+    repo = repository_with(app_config, approved_job(seconds_from_now=-10))
+    fake = FakePublisher()
+
+    await JobExecutor(app_config, repo, lambda: fake).execute("job-1")
+
+    job = repo.get_job("job-1")
+    assert job is not None
+    assert job.status is JobStatus.MISSED
+    assert fake.prepare_calls == 0
+    assert fake.submit_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_fingerprint_mismatch_needs_attention(
     app_config: AppConfig,
     tmp_path: Path,
@@ -396,6 +412,34 @@ async def test_prepare_exception_is_failed_and_closes_once(
     assert job is not None
     assert job.status is JobStatus.FAILED
     assert job.last_error == "composer unavailable"
+    assert fake.submit_calls == 0
+    assert fake.close_calls == 1
+    assert job.artifact_dir is not None
+    assert job.artifact_dir.is_dir()
+    assert attempts[0]["outcome"] == AttemptOutcome.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_ready_pre_submit_exception_needs_attention(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config, approved_job())
+    fake = FakePublisher()
+
+    async def fail_sleep(delay: float) -> None:
+        del delay
+        raise RuntimeError("wait interrupted")
+
+    monkeypatch.setattr("weibo_publisher.scheduler.asyncio.sleep", fail_sleep)
+
+    await JobExecutor(app_config, repo, lambda: fake).execute("job-1")
+
+    job = repo.get_job("job-1")
+    attempts = repo.list_attempts("job-1")
+    assert job is not None
+    assert job.status is JobStatus.NEEDS_ATTENTION
+    assert job.last_error == "wait interrupted"
     assert fake.submit_calls == 0
     assert fake.close_calls == 1
     assert attempts[0]["outcome"] == AttemptOutcome.FAILED.value
@@ -658,6 +702,34 @@ async def test_scan_marks_late_approved_job_missed(app_config: AppConfig) -> Non
 
 
 @pytest.mark.asyncio
+async def test_scan_does_not_prepare_approved_job_inside_late_cutoff(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config, approved_job(seconds_from_now=-10))
+    added: list[dict[str, object]] = []
+
+    def record_add_job(callback, trigger, **kwargs) -> None:
+        added.append({"callback": callback, "trigger": trigger, **kwargs})
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=lambda job_id: None,
+    )
+    monkeypatch.setattr(runner.scheduler, "add_job", record_add_job)
+
+    await runner.scan_once()
+
+    job = repo.get_job("job-1")
+    assert job is not None
+    assert job.status is JobStatus.MISSED
+    assert added == []
+    assert runner.scheduled == set()
+
+
+@pytest.mark.asyncio
 async def test_scan_removes_job_that_is_no_longer_approved(
     app_config: AppConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -691,6 +763,52 @@ async def test_scan_removes_job_that_is_no_longer_approved(
 
     assert runner.scheduled == set()
     assert removed == ["job:job-1"]
+
+
+@pytest.mark.asyncio
+async def test_callback_failure_allows_later_scan_to_reschedule_approved_job(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config, approved_job(seconds_from_now=600))
+    added: list[dict[str, object]] = []
+
+    def record_add_job(callback, trigger, **kwargs) -> None:
+        added.append({"callback": callback, "trigger": trigger, **kwargs})
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+    )
+    monkeypatch.setattr(runner.scheduler, "add_job", record_add_job)
+
+    await runner.scan_once()
+    assert runner.scheduled == {"job-1"}
+
+    original_get_job = repo.get_job
+    should_fail = True
+
+    def flaky_get_job(job_id: str) -> Job | None:
+        if should_fail:
+            raise RuntimeError("temporary database read failure")
+        return original_get_job(job_id)
+
+    monkeypatch.setattr(repo, "get_job", flaky_get_job)
+    callback = added[0]["callback"]
+    with pytest.raises(RuntimeError, match="temporary database read failure"):
+        await callback()
+
+    assert runner.scheduled == set()
+    still_approved = original_get_job("job-1")
+    assert still_approved is not None
+    assert still_approved.status is JobStatus.APPROVED
+
+    should_fail = False
+    await runner.scan_once()
+
+    assert len(added) == 2
+    assert runner.scheduled == {"job-1"}
 
 
 def test_runner_acquires_persistent_lock_with_no_os_lock(
@@ -876,6 +994,9 @@ async def test_recovery_marks_interrupted_jobs_for_attention(
     ready.id = "ready"
     ready.status = JobStatus.READY
     repo = repository_with(app_config, publishing, preparing, ready)
+    repo.record_attempt("publishing", "attempt-publishing")
+    repo.record_attempt("preparing", "attempt-preparing")
+    repo.record_attempt("ready", "attempt-ready")
     runner = Runner(app_config, repo, lambda: FakePublisher())
 
     await runner.recover_interrupted()
@@ -894,6 +1015,21 @@ async def test_recovery_marks_interrupted_jobs_for_attention(
     assert recovered_ready.status is JobStatus.NEEDS_ATTENTION
     assert recovered_ready.last_error is not None
     assert "browser context" in recovered_ready.last_error.lower()
+
+    attempts = {
+        attempt["attempt_id"]: attempt
+        for attempt in (
+            repo.list_attempts("publishing")
+            + repo.list_attempts("preparing")
+            + repo.list_attempts("ready")
+        )
+    }
+    assert attempts["attempt-publishing"]["outcome"] == AttemptOutcome.UNKNOWN.value
+    assert attempts["attempt-publishing"]["error"] == "Runner restarted during submission"
+    assert attempts["attempt-preparing"]["outcome"] == AttemptOutcome.INTERRUPTED.value
+    assert attempts["attempt-preparing"]["finished_at"] is not None
+    assert attempts["attempt-ready"]["outcome"] == AttemptOutcome.INTERRUPTED.value
+    assert attempts["attempt-ready"]["error"] == recovered_ready.last_error
 
 
 @pytest.mark.asyncio

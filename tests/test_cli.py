@@ -82,6 +82,41 @@ def test_add_creates_draft_and_confirm_approves(tmp_path: Path, monkeypatch) -> 
     assert approved.fingerprint
 
 
+def test_confirm_rejects_followers_visibility(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"jpeg")
+    monkeypatch.chdir(tmp_path)
+    future = datetime.now(UTC) + timedelta(days=1)
+
+    assert main(
+        [
+            "add",
+            "--text",
+            "仅粉丝可见",
+            "--image",
+            str(image),
+            "--at",
+            future.isoformat(),
+            "--visibility",
+            "followers",
+        ]
+    ) == 0
+    draft = _only_draft(tmp_path)
+
+    code = main(["confirm", draft.id])
+
+    assert code == 2
+    assert "followers visibility is not supported yet" in capsys.readouterr().out
+    loaded = JobRepository(load_config(root=tmp_path).db_path).get_job(draft.id)
+    assert loaded is not None
+    assert loaded.status is JobStatus.DRAFT
+    assert loaded.fingerprint == ""
+
+
 def test_confirm_rejects_missing_image(tmp_path: Path, monkeypatch, capsys) -> None:
     image = tmp_path / "image.jpg"
     image.write_bytes(b"jpeg")
@@ -327,6 +362,41 @@ def test_status_shows_artifact_path(tmp_path: Path, monkeypatch, capsys) -> None
 
     assert main(["status", draft.id]) == 0
     assert "Artifact" in capsys.readouterr().out
+
+
+def test_status_shows_artifact_last_error_and_weibo_url(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = load_config(root=tmp_path)
+    ensure_runtime_dirs(config)
+    repo = JobRepository(config.db_path)
+    repo.initialize()
+    artifact_dir = config.artifacts_dir / "failed-job" / "attempt-1"
+    job = Job(
+        id="failed-job",
+        text="失败任务",
+        images=[],
+        publish_at_utc=datetime.now(UTC) + timedelta(days=1),
+        timezone="Asia/Shanghai",
+        visibility=Visibility.PUBLIC,
+        status=JobStatus.NEEDS_ATTENTION,
+        fingerprint="fp",
+        created_at=datetime.now(UTC),
+        last_error="composer unavailable",
+        artifact_dir=artifact_dir,
+        weibo_url="https://weibo.com/detail/123",
+    )
+    repo.create_job(job)
+
+    assert main(["status", job.id]) == 0
+
+    output = capsys.readouterr().out
+    assert f"Artifact: {artifact_dir}" in output
+    assert "Last error: composer unavailable" in output
+    assert "Weibo URL: https://weibo.com/detail/123" in output
 
 
 def test_run_reports_startup_and_lock_collision(

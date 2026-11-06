@@ -17,6 +17,11 @@ ACTIVE_STATUSES = {
     JobStatus.PUBLISHING,
     JobStatus.PUBLISHED,
 }
+SQLITE_BUSY_TIMEOUT_MS = 5_000
+
+
+class ConfirmationError(ValueError):
+    pass
 
 
 _SCHEMA = """
@@ -56,8 +61,12 @@ class JobRepository:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self._db_path)
+        connection = sqlite3.connect(
+            self._db_path,
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1_000,
+        )
         connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
@@ -179,6 +188,21 @@ class JobRepository:
         timezone_name: str,
         exclude_job_id: str | None = None,
     ) -> int:
+        with self._connect() as connection:
+            return self._count_for_local_date(
+                connection,
+                local_date,
+                timezone_name,
+                exclude_job_id,
+            )
+
+    def _count_for_local_date(
+        self,
+        connection: sqlite3.Connection,
+        local_date: date,
+        timezone_name: str,
+        exclude_job_id: str | None = None,
+    ) -> int:
         start_local = datetime.combine(
             local_date,
             datetime.min.time(),
@@ -195,18 +219,17 @@ class JobRepository:
         ]
         if exclude_job_id is not None:
             parameters.append(exclude_job_id)
-        with self._connect() as connection:
-            row = connection.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM jobs
-                WHERE status IN ({placeholders})
-                  AND publish_at_utc >= ?
-                  AND publish_at_utc < ?
-                  {exclusion}
-                """,
-                parameters,
-            ).fetchone()
+        row = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE status IN ({placeholders})
+              AND publish_at_utc >= ?
+              AND publish_at_utc < ?
+              {exclusion}
+            """,
+            parameters,
+        ).fetchone()
         return int(row[0])
 
     def find_gap_conflict(
@@ -214,26 +237,116 @@ class JobRepository:
         publish_at_utc: datetime,
         gap_seconds: int,
     ) -> Job | None:
+        with self._connect() as connection:
+            return self._find_gap_conflict(
+                connection,
+                publish_at_utc,
+                gap_seconds,
+            )
+
+    def _find_gap_conflict(
+        self,
+        connection: sqlite3.Connection,
+        publish_at_utc: datetime,
+        gap_seconds: int,
+    ) -> Job | None:
         start = publish_at_utc - timedelta(seconds=gap_seconds)
         end = publish_at_utc + timedelta(seconds=gap_seconds)
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
-        with self._connect() as connection:
-            row = connection.execute(
-                f"""
-                SELECT *
-                FROM jobs
-                WHERE status IN ({placeholders})
-                  AND publish_at_utc BETWEEN ? AND ?
-                ORDER BY publish_at_utc
-                LIMIT 1
-                """,
-                [
-                    *(status.value for status in ACTIVE_STATUSES),
-                    start.isoformat(),
-                    end.isoformat(),
-                ],
-            ).fetchone()
+        row = connection.execute(
+            f"""
+            SELECT *
+            FROM jobs
+            WHERE status IN ({placeholders})
+              AND publish_at_utc BETWEEN ? AND ?
+            ORDER BY publish_at_utc
+            LIMIT 1
+            """,
+            [
+                *(status.value for status in ACTIVE_STATUSES),
+                start.isoformat(),
+                end.isoformat(),
+            ],
+        ).fetchone()
         return self._row_to_job(row) if row else None
+
+    def confirm_job(
+        self,
+        job_id: str,
+        fingerprint: str,
+        confirmed_at: datetime,
+        *,
+        daily_limit: int,
+        minimum_gap_seconds: int,
+        allow_over_limit: bool,
+    ) -> Job:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ConfirmationError(f"job not found: {job_id}")
+
+            job = self._row_to_job(row)
+            if job.status is not JobStatus.DRAFT:
+                raise ConfirmationError(f"job is not a draft: {job.status}")
+            if job.visibility is not Visibility.PUBLIC:
+                raise ConfirmationError(
+                    "followers visibility is not supported yet"
+                )
+
+            if not allow_over_limit:
+                local_date = job.publish_at_utc.astimezone(
+                    ZoneInfo(job.timezone)
+                ).date()
+                count = self._count_for_local_date(
+                    connection,
+                    local_date,
+                    job.timezone,
+                    exclude_job_id=job.id,
+                )
+                if count >= daily_limit:
+                    raise ConfirmationError("daily limit reached")
+
+            conflict = self._find_gap_conflict(
+                connection,
+                job.publish_at_utc,
+                minimum_gap_seconds,
+            )
+            if conflict is not None and conflict.id != job.id:
+                raise ConfirmationError(
+                    f"publish time conflicts with job {conflict.id} "
+                    "within minimum gap"
+                )
+
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?,
+                    fingerprint = ?,
+                    confirmed_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    JobStatus.APPROVED.value,
+                    fingerprint,
+                    self._to_iso(confirmed_at),
+                    job_id,
+                    JobStatus.DRAFT.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConfirmationError("job state changed while confirming")
+
+            confirmed = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if confirmed is None:
+                raise ConfirmationError("job disappeared while confirming")
+            return self._row_to_job(confirmed)
 
     def record_attempt(self, job_id: str, attempt_id: str) -> None:
         with self._connect() as connection:
@@ -269,6 +382,28 @@ class JobRepository:
                     attempt_id,
                 ),
             )
+
+    def finish_open_attempts(
+        self,
+        job_id: str,
+        outcome: str,
+        error: str | None,
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE attempts
+                SET finished_at = ?, outcome = ?, error = ?
+                WHERE job_id = ? AND finished_at IS NULL
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    outcome,
+                    error,
+                    job_id,
+                ),
+            )
+            return cursor.rowcount
 
     def list_attempts(self, job_id: str) -> list[dict[str, str | None]]:
         with self._connect() as connection:

@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from weibo_publisher.config import ensure_runtime_dirs, load_config
 from weibo_publisher.logging_setup import configure_logging
 from weibo_publisher.models import Job, JobStatus, Visibility
-from weibo_publisher.repository import JobRepository
+from weibo_publisher.repository import ConfirmationError, JobRepository
 from weibo_publisher.scheduler import Runner, RunnerLockError
 from weibo_publisher.validation import (
     build_fingerprint,
@@ -204,6 +204,8 @@ def _cmd_confirm(args: argparse.Namespace) -> int:
         return _fail(f"job not found: {args.job_id}")
     if job.status is not JobStatus.DRAFT:
         return _fail(f"job is not a draft: {job.status}")
+    if job.visibility is not Visibility.PUBLIC:
+        return _fail("followers visibility is not supported yet")
     if not normalize_text(job.text):
         return _fail("text must not be empty")
 
@@ -217,34 +219,23 @@ def _cmd_confirm(args: argparse.Namespace) -> int:
     if job.publish_at_utc < earliest:
         return _fail("publish time is too soon")
 
-    if not config.allow_over_limit:
-        local_date = job.publish_at_utc.astimezone(ZoneInfo(job.timezone)).date()
-        count = repo.count_for_local_date(local_date, job.timezone)
-        if count >= config.daily_limit:
-            return _fail("daily limit reached")
-
-    conflict = repo.find_gap_conflict(
-        job.publish_at_utc,
-        config.minimum_gap_seconds,
-    )
-    if conflict is not None and conflict.id != job.id:
-        return _fail(f"publish time conflicts with job {conflict.id} within minimum gap")
-
     fingerprint = build_fingerprint(
         job.text,
         job.images,
         job.publish_at_utc,
         job.visibility,
     )
-    changed = repo.transition(
-        job.id,
-        {JobStatus.DRAFT},
-        JobStatus.APPROVED,
-        fingerprint=fingerprint,
-        confirmed_at=now,
-    )
-    if not changed:
-        return _fail("job state changed while confirming")
+    try:
+        repo.confirm_job(
+            job.id,
+            fingerprint,
+            now,
+            daily_limit=config.daily_limit,
+            minimum_gap_seconds=config.minimum_gap_seconds,
+            allow_over_limit=config.allow_over_limit,
+        )
+    except ConfirmationError as exc:
+        return _fail(str(exc))
 
     print(f"Confirmed {job.id}")
     return 0
@@ -319,6 +310,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"Job: {job.id}")
     print(f"Status: {job.status.value}")
     print(f"Artifact: {job.artifact_dir or '(none)'}")
+    print(f"Last error: {job.last_error or '(none)'}")
+    if job.weibo_url:
+        print(f"Weibo URL: {job.weibo_url}")
     attempts = repo.list_attempts(job.id)
     if not attempts:
         print("Attempts: none")
