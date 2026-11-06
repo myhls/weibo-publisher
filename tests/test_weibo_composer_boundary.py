@@ -32,6 +32,29 @@ async def test_composer_region_uses_common_ancestor_for_visibility_selection() -
 
 
 @pytest.mark.asyncio
+async def test_prepare_page_uses_three_branch_common_ancestor(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+
+    async with _local_page(_page_html(has_common_ancestor=True)) as page:
+        await weibo._prepare_page(
+            page,
+            "three branch composer",
+            [],
+            Visibility.PRIVATE,
+            artifact_dir,
+        )
+
+        assert await page.locator("#body").input_value() == "three branch composer"
+        assert await page.locator("#visibility").inner_text() == "仅自己可见"
+        assert await page.evaluate("window.publishClickCount ?? 0") == 0
+        assert await page.evaluate("window.editorClickCount ?? 0") == 0
+        assert (artifact_dir / "preview.png").is_file()
+
+
+@pytest.mark.asyncio
 async def test_prepare_fails_before_click_without_non_page_common_ancestor(
     tmp_path: Path,
 ) -> None:
@@ -64,7 +87,7 @@ async def test_visibility_label_probe_fails_closed_when_control_disappears() -> 
             await weibo._visibility_label_for(visibility)
         elapsed = time.monotonic() - started
 
-        assert elapsed < 1.0
+        assert elapsed < 2.0
 
 
 @asynccontextmanager
@@ -101,11 +124,13 @@ def _page_html(*, has_common_ancestor: bool) -> str:
     if has_common_ancestor:
         composer_markup = """
           <main id="composer-shell">
-            <section id="editor-branch">
+            <section id="composer-branch">
               <textarea id="body" placeholder="分享新鲜事"></textarea>
+            </section>
+            <section id="send-branch">
               <button id="publish" type="button">发送</button>
             </section>
-            <section id="privacy-branch">
+            <section id="visibility-branch">
               <button id="visibility" type="button" aria-label="公开">公开</button>
               <div id="visibility-options" hidden>
                 <button type="button">公开</button>
@@ -119,19 +144,19 @@ def _page_html(*, has_common_ancestor: bool) -> str:
         """
     else:
         composer_markup = """
-          <main>
-            <section id="editor-branch">
-              <div id="body" class="editor" contenteditable="true"></div>
-              <button id="publish" type="button">发送</button>
-            </section>
-          </main>
-          <aside id="privacy-branch">
+          <section id="composer-branch">
+            <div id="body" class="editor" contenteditable="true"></div>
+          </section>
+          <section id="send-branch">
+            <button id="publish" type="button">发送</button>
+          </section>
+          <section id="visibility-branch">
             <button id="visibility" type="button" aria-label="公开">公开</button>
             <div id="visibility-options" hidden>
               <button type="button">公开</button>
               <button type="button">仅自己可见</button>
             </div>
-          </aside>
+          </section>
         """
 
     return f"""

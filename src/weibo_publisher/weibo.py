@@ -740,6 +740,7 @@ async def _ensure_visibility(
 
 
 async def _find_visibility_trigger(composer_region: Locator) -> Locator:
+    fallback: Locator | None = None
     for selector in VISIBILITY_SELECTORS:
         locator = composer_region.locator(selector)
         for index in range(await locator.count()):
@@ -747,15 +748,41 @@ async def _find_visibility_trigger(composer_region: Locator) -> Locator:
             if not await candidate.is_visible():
                 continue
             if await _visibility_label_for(candidate) is not None:
-                return candidate
+                if await _is_interactive_visibility_trigger(candidate):
+                    return candidate
+                if fallback is None:
+                    fallback = candidate
 
     for label in _KNOWN_VISIBILITY_LABELS:
         locator = composer_region.get_by_text(label, exact=True)
         for index in range(await locator.count()):
             candidate = locator.nth(index)
-            if await candidate.is_visible():
+            if not await candidate.is_visible():
+                continue
+            if await _is_interactive_visibility_trigger(candidate):
                 return candidate
+            if fallback is None:
+                fallback = candidate
+    if fallback is not None:
+        return fallback
     raise RuntimeError("Weibo visibility control could not be found")
+
+
+async def _is_interactive_visibility_trigger(candidate: Locator) -> bool:
+    try:
+        return bool(
+            await candidate.evaluate(
+                """
+                (element) => element.matches(
+                  'button, a, [role="button"], [data-visibility], ' +
+                  '[data-testid="visibility"]'
+                )
+                """,
+                timeout=_VISIBILITY_PROBE_TIMEOUT_MS,
+            )
+        )
+    except Exception:  # noqa: BLE001 - fall back to another candidate
+        return False
 
 
 async def _first_visible_exact_text(
