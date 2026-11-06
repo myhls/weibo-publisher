@@ -173,7 +173,12 @@ class JobRepository:
             cursor = connection.execute(sql, values)
             return cursor.rowcount == 1
 
-    def count_for_local_date(self, local_date: date, timezone_name: str) -> int:
+    def count_for_local_date(
+        self,
+        local_date: date,
+        timezone_name: str,
+        exclude_job_id: str | None = None,
+    ) -> int:
         start_local = datetime.combine(
             local_date,
             datetime.min.time(),
@@ -182,6 +187,14 @@ class JobRepository:
         start_utc = start_local.astimezone(UTC)
         end_utc = (start_local + timedelta(days=1)).astimezone(UTC)
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        exclusion = " AND id != ?" if exclude_job_id is not None else ""
+        parameters: list[object] = [
+            *(status.value for status in ACTIVE_STATUSES),
+            start_utc.isoformat(),
+            end_utc.isoformat(),
+        ]
+        if exclude_job_id is not None:
+            parameters.append(exclude_job_id)
         with self._connect() as connection:
             row = connection.execute(
                 f"""
@@ -190,12 +203,9 @@ class JobRepository:
                 WHERE status IN ({placeholders})
                   AND publish_at_utc >= ?
                   AND publish_at_utc < ?
+                  {exclusion}
                 """,
-                [
-                    *(status.value for status in ACTIVE_STATUSES),
-                    start_utc.isoformat(),
-                    end_utc.isoformat(),
-                ],
+                parameters,
             ).fetchone()
         return int(row[0])
 
