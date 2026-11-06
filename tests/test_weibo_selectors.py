@@ -357,12 +357,19 @@ _IMAGE_PREVIEW_SCRIPT = """
 
 
 def _html(body: str, script: str = "") -> str:
+    visibility = (
+        '<button id="visibility" type="button" aria-label="公开">公开</button>'
+    )
+    if "</main>" in body:
+        before, after = body.rsplit("</main>", 1)
+        body = f"{before}{visibility}</main>{after}"
+    else:
+        body = f"{body}{visibility}"
     return (
         "<!doctype html><html><head>"
         f"{script}{_IMAGE_PREVIEW_SCRIPT}"
         "</head><body>"
         f"{body}"
-        '<button id="visibility" type="button" aria-label="公开">公开</button>'
         "</body></html>"
     )
 

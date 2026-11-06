@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
@@ -33,8 +34,11 @@ IMAGE_INPUT_SELECTORS = [
 ]
 PUBLISH_SELECTORS = [
     'button:has-text("发布")',
+    'button:has-text("发送")',
     'a:has-text("发布")',
+    'a:has-text("发送")',
     '[class*="submit"]:has-text("发布")',
+    '[class*="submit"]:has-text("发送")',
 ]
 VISIBILITY_SELECTORS = [
     '[data-testid="visibility"]',
@@ -264,7 +268,8 @@ async def _prepare_page(
         await _wait_for_uploads(page)
         await _wait_for_uploaded_image_previews(page, len(images))
 
-    await _ensure_visibility(page, visibility)
+    composer_region = await _active_composer_region(composer)
+    await _ensure_visibility(composer_region, visibility)
 
     await page.screenshot(
         path=str(artifact_dir / "preview.png"),
@@ -272,7 +277,7 @@ async def _prepare_page(
     )
 
 
-async def first_visible(page: Page, selectors: list[str]) -> Locator:
+async def first_visible(page: Page | Locator, selectors: list[str]) -> Locator:
     for selector in selectors:
         locator = page.locator(selector)
         for index in range(await locator.count()):
@@ -280,6 +285,36 @@ async def first_visible(page: Page, selectors: list[str]) -> Locator:
             if await candidate.is_visible():
                 return candidate
     raise RuntimeError("No matching Weibo control found")
+
+
+async def _active_composer_region(composer: Locator) -> Locator:
+    current = composer
+    for _ in range(20):
+        parent = current.locator("xpath=..")
+        if await parent.count() == 0:
+            break
+        parent = parent.first
+        tag_name = await parent.evaluate(
+            "(element) => element.tagName.toLowerCase()"
+        )
+        if tag_name in {"body", "html"}:
+            break
+        if await _has_visible_control(parent, PUBLISH_SELECTORS):
+            return parent
+        current = parent
+    raise RuntimeError("Active Weibo composer region could not be identified")
+
+
+async def _has_visible_control(
+    root: Page | Locator,
+    selectors: list[str],
+) -> bool:
+    for selector in selectors:
+        locator = root.locator(selector)
+        for index in range(await locator.count()):
+            if await locator.nth(index).is_visible():
+                return True
+    return False
 
 
 def parse_publish_response(payload: dict) -> PublishResult:
@@ -360,7 +395,7 @@ def _post_id_from_payload(payload: dict) -> str | None:
         if isinstance(raw_mid, bool) or not isinstance(raw_mid, (str, int)):
             continue
         mid = str(raw_mid).strip()
-        if mid:
+        if re.fullmatch(r"[1-9][0-9]*", mid):
             return mid
     return None
 
@@ -532,7 +567,8 @@ async def _validate_submit_page(
     if await _has_visible_indicator(page):
         raise RuntimeError("image upload has not completed")
 
-    visibility_label = await _read_visibility_label(page)
+    composer_region = await _active_composer_region(composer)
+    visibility_label = await _read_visibility_label(composer_region)
     if visibility_label is None:
         raise RuntimeError("visibility could not be verified before submit")
     expected_labels = _visibility_labels_for(visibility)
@@ -626,9 +662,9 @@ def _parse_attached_image_identities(
     return tuple(identities)
 
 
-async def _read_visibility_label(page: Page) -> str | None:
+async def _read_visibility_label(composer_region: Locator) -> str | None:
     for selector in VISIBILITY_SELECTORS:
-        locator = page.locator(selector)
+        locator = composer_region.locator(selector)
         for index in range(await locator.count()):
             candidate = locator.nth(index)
             if not await candidate.is_visible():
@@ -638,48 +674,47 @@ async def _read_visibility_label(page: Page) -> str | None:
                 return label
 
     for label in _KNOWN_VISIBILITY_LABELS:
-        locator = page.get_by_text(label, exact=True)
+        locator = composer_region.get_by_text(label, exact=True)
         for index in range(await locator.count()):
             if await locator.nth(index).is_visible():
                 return label
     return None
 
 
-async def _ensure_visibility(page: Page, visibility: Visibility) -> None:
-    if visibility is Visibility.PUBLIC:
-        current = await _read_visibility_label(page)
-        if current not in _PUBLIC_VISIBILITY_LABELS:
-            current_label = current or "unavailable"
-            raise RuntimeError(
-                "public visibility could not be verified after preparation; "
-                f"current label is {current_label}"
-            )
+async def _ensure_visibility(
+    composer_region: Locator,
+    visibility: Visibility,
+) -> None:
+    expected_labels = _visibility_labels_for(visibility)
+    target_label = (
+        _PRIVATE_VISIBILITY_LABEL
+        if visibility is Visibility.PRIVATE
+        else "公开"
+    )
+    current = await _read_visibility_label(composer_region)
+    if current in expected_labels:
         return
 
-    if visibility is Visibility.PRIVATE:
-        current = await _read_visibility_label(page)
-        if current == _PRIVATE_VISIBILITY_LABEL:
-            return
-
-        trigger = await _find_visibility_trigger(page)
-        await trigger.click()
-        option = await _first_visible_exact_text(
-            page,
-            _PRIVATE_VISIBILITY_LABEL,
+    if current not in _KNOWN_VISIBILITY_LABELS:
+        current_label = current or "unavailable"
+        raise RuntimeError(
+            f"Weibo visibility {target_label} could not be selected; "
+            f"current composer label is {current_label}"
         )
-        await option.click()
-        await _wait_for_locator_visibility(
-            trigger,
-            visibility,
-        )
-        return
 
-    raise RuntimeError("followers visibility is not supported yet")
+    trigger = await _find_visibility_trigger(composer_region)
+    await trigger.click()
+    option = await _first_visible_exact_text(
+        composer_region,
+        target_label,
+    )
+    await option.click()
+    await _wait_for_locator_visibility(trigger, visibility)
 
 
-async def _find_visibility_trigger(page: Page) -> Locator:
+async def _find_visibility_trigger(composer_region: Locator) -> Locator:
     for selector in VISIBILITY_SELECTORS:
-        locator = page.locator(selector)
+        locator = composer_region.locator(selector)
         for index in range(await locator.count()):
             candidate = locator.nth(index)
             if not await candidate.is_visible():
@@ -688,7 +723,7 @@ async def _find_visibility_trigger(page: Page) -> Locator:
                 return candidate
 
     for label in _KNOWN_VISIBILITY_LABELS:
-        locator = page.get_by_text(label, exact=True)
+        locator = composer_region.get_by_text(label, exact=True)
         for index in range(await locator.count()):
             candidate = locator.nth(index)
             if await candidate.is_visible():
@@ -696,8 +731,11 @@ async def _find_visibility_trigger(page: Page) -> Locator:
     raise RuntimeError("Weibo visibility control could not be found")
 
 
-async def _first_visible_exact_text(page: Page, text: str) -> Locator:
-    locator = page.get_by_text(text, exact=True)
+async def _first_visible_exact_text(
+    composer_region: Locator,
+    text: str,
+) -> Locator:
+    locator = composer_region.get_by_text(text, exact=True)
     for index in range(await locator.count()):
         candidate = locator.nth(index)
         if await candidate.is_visible():

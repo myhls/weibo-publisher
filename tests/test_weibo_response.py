@@ -137,6 +137,39 @@ def test_parse_success_without_valid_id_is_unknown(payload: dict[str, Any]) -> N
     assert result.error == "Success code without post ID"
 
 
+@pytest.mark.parametrize(
+    "post_id",
+    ["0", "-1", "1.5", "abc", "１２３", "000123"],
+)
+@pytest.mark.parametrize(
+    "payload_template",
+    [
+        {"code": 100000, "data": {"idstr": "{post_id}"}},
+        {"ok": 1, "data": {"mid": "{post_id}"}},
+    ],
+)
+def test_parse_success_with_malformed_or_nonpositive_id_is_unknown(
+    payload_template: dict[str, Any],
+    post_id: str,
+) -> None:
+    payload = {
+        key: (
+            {
+                nested_key: nested_value.replace("{post_id}", post_id)
+                for nested_key, nested_value in value.items()
+            }
+            if isinstance(value, dict)
+            else value
+        )
+        for key, value in payload_template.items()
+    }
+
+    result = parse_publish_response(payload)
+
+    assert result.outcome is AttemptOutcome.UNKNOWN
+    assert result.error
+
+
 @pytest.mark.asyncio
 async def test_submit_requires_prepare(tmp_path: Path, app_config: AppConfig) -> None:
     publisher = WeiboPublisher(_local_config(app_config))
@@ -494,6 +527,66 @@ async def test_submit_rejects_public_label_for_private_job_before_click(
     assert observed["post_requests"] == 0
 
 
+@pytest.mark.parametrize("decoy_kind", ["outside-control", "body-text"])
+@pytest.mark.asyncio
+async def test_submit_ignores_private_label_decoys_outside_composer(
+    decoy_kind: str,
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job(visibility=Visibility.PRIVATE)
+    artifact_dir = app_config.artifacts_dir / f"job-private-decoy-{decoy_kind}"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"ok": 1, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.evaluate(
+            """
+            (kind) => {
+              const composerLabel = document.querySelector("#visibility");
+              composerLabel.replaceWith(
+                Object.assign(document.createElement("div"), {
+                  id: "composer-public-label",
+                  textContent: "公开",
+                })
+              );
+              if (kind === "outside-control") {
+                const aside = document.createElement("aside");
+                aside.innerHTML =
+                  '<button id="visibility-decoy" type="button">' +
+                  "仅自己可见</button>";
+                document.body.appendChild(aside);
+              } else {
+                const decoy = document.createElement("div");
+                decoy.textContent = "仅自己可见";
+                decoy.style.cssText =
+                  "position:fixed;left:0;top:0;background:white";
+                document.body.appendChild(decoy);
+              }
+            }
+            """,
+            decoy_kind,
+        )
+        result = await publisher.submit(job, artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error is not None
+    assert "visibility" in result.error.lower()
+    assert click_count == 0
+    assert observed["post_requests"] == 0
+
+
 @pytest.mark.asyncio
 async def test_prepare_selects_and_verifies_private_visibility_after_content(
     app_config: AppConfig,
@@ -526,6 +619,44 @@ async def test_prepare_selects_and_verifies_private_visibility_after_content(
         await publisher.close()
 
     assert current_label == "仅自己可见"
+    assert prepared_before_opening is True
+    assert click_count == 0
+    assert (artifact_dir / "preview.png").is_file()
+
+
+@pytest.mark.asyncio
+async def test_prepare_selects_public_when_composer_initially_shows_private(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\npublic")
+    job = _job(images=[image], visibility=Visibility.PUBLIC)
+    artifact_dir = app_config.artifacts_dir / "job-public-reselect"
+
+    publisher, _ = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"ok": 1, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+        initial_visibility="仅自己可见",
+    )
+
+    try:
+        assert publisher.page is not None
+        current_label = await publisher.page.locator("#visibility").inner_text()
+        prepared_before_opening = await publisher.page.evaluate(
+            "window.visibilityOpenedWithPreparedContent"
+        )
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert current_label == "公开"
     assert prepared_before_opening is True
     assert click_count == 0
     assert (artifact_dir / "preview.png").is_file()
@@ -607,12 +738,17 @@ async def _prepared_publisher(
     response_payload: dict[str, Any] | None,
     artifact_dir: Path,
     job: Job | None = None,
+    initial_visibility: str = "公开",
 ) -> tuple[WeiboPublisher, dict[str, int]]:
     observed = {"post_requests": 0}
     monkeypatch.setattr(
         weibo,
         "persistent_context",
-        _routed_context_factory(response_payload, observed),
+        _routed_context_factory(
+            response_payload,
+            observed,
+            initial_visibility=initial_visibility,
+        ),
     )
     publisher = WeiboPublisher(_local_config(app_config))
     await publisher.prepare(job or _job(), artifact_dir)
@@ -622,6 +758,8 @@ async def _prepared_publisher(
 def _routed_context_factory(
     response_payload: dict[str, Any] | None,
     observed: dict[str, int],
+    *,
+    initial_visibility: str = "公开",
 ):
     @asynccontextmanager
     async def routed_context(config: AppConfig) -> AsyncIterator[BrowserContext]:
@@ -631,7 +769,12 @@ def _routed_context_factory(
             context = await browser.new_context()
             await context.route(
                 "https://weibo.com/",
-                _html_route(_page_html(sends_post=response_payload is not None)),
+                _html_route(
+                    _page_html(
+                        sends_post=response_payload is not None,
+                        initial_visibility=initial_visibility,
+                    )
+                ),
             )
             await context.route(
                 _PUBLISH_URL,
@@ -650,7 +793,7 @@ def _routed_context_factory(
     return routed_context
 
 
-def _page_html(*, sends_post: bool) -> str:
+def _page_html(*, sends_post: bool, initial_visibility: str = "公开") -> str:
     post_request = (
         'fetch("/ajax/statuses/update", { method: "POST" });'
         if sends_post
@@ -664,7 +807,7 @@ def _page_html(*, sends_post: bool) -> str:
         <main>
           <textarea id="body" placeholder="分享新鲜事"></textarea>
           <input id="image" type="file" accept="image/*" multiple style="display:none">
-          <button id="visibility" type="button" aria-label="公开">公开</button>
+          <button id="visibility" type="button" aria-label="{initial_visibility}">{initial_visibility}</button>
           <div id="visibility-options" hidden>
             <button type="button">公开</button>
             <button type="button">粉丝</button>

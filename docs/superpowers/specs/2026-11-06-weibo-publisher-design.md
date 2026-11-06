@@ -14,8 +14,9 @@ multi-account management, AI content generation, or a web dashboard.
 ## 2. Goals
 
 - Publish text and image posts to one Weibo account.
-- Support public visibility by default and retain a visibility field for future
-  expansion.
+- Support `public` visibility by default and `private` visibility mapped to
+  Weibo `仅自己可见`. Followers, friends-circle, and group visibility remain
+  unsupported.
 - Accept ISO 8601 timestamps with an explicit timezone.
 - Default task scheduling to Asia/Shanghai.
 - Reuse a dedicated Playwright browser profile created by QR-code login.
@@ -136,7 +137,8 @@ Creates a `draft` task. Required options:
 
 Optional:
 
-- `--visibility public|followers`
+- `--visibility public|private` (default: `public`; `private` maps to
+  `仅自己可见`)
 - `--timezone Asia/Shanghai`
 - `--file` for a JSON task description
 
@@ -163,7 +165,8 @@ Performs a safe Weibo UI rehearsal:
 - opens the composer
 - enters the text
 - attaches images
-- verifies the selected visibility
+- selects the requested visibility within the active composer and verifies the
+  composer's resulting label before continuing
 - captures a screenshot
 - does not click publish
 
@@ -185,7 +188,7 @@ Each job stores:
 - `images`: JSON array of local paths
 - `publish_at_utc`: canonical UTC timestamp
 - `timezone`: IANA timezone name
-- `visibility`: public or followers
+- `visibility`: `public` or `private`; `private` maps to Weibo `仅自己可见`
 - `status`: state machine value
 - `fingerprint`: confirmation fingerprint
 - `created_at`
@@ -314,12 +317,16 @@ The adapter must prefer semantic selectors and stable attributes. Broad
 class-name selectors are allowed only as fallbacks and must be covered by
 manual smoke tests.
 
+Visibility controls and dropdown options must be resolved within the active
+composer region. Page-wide text matches must not be accepted as proof of the
+composer's selected visibility.
+
 Success detection:
 
 - Observe the POST request to the Weibo publish endpoint.
 - Parse the JSON response.
-- Treat the documented success code as success only when it contains a post ID
-  or result URL.
+- Treat `ok: 1` or the legacy `code: 100000` as success only when a positive
+  numeric post ID is present.
 - If the click happened but no unambiguous success or failure can be
   established, return `unknown`.
 
