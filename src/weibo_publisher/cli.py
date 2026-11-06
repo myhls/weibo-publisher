@@ -366,16 +366,19 @@ def _cmd_preview(args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     repo, config = _repository_from_args(args)
     configure_logging(config)
-    from weibo_publisher.weibo import WeiboPublisher
 
-    runner = Runner(
-        config,
-        repo,
-        lambda: WeiboPublisher(config),
-    )
-    print("Runner started. Press Ctrl+C to stop.")
+    def report_started() -> None:
+        print("Runner started. Press Ctrl+C to stop.")
+
     try:
-        asyncio.run(runner.run_forever())
+        from weibo_publisher.weibo import WeiboPublisher
+
+        runner = Runner(
+            config,
+            repo,
+            lambda: WeiboPublisher(config),
+        )
+        asyncio.run(runner.run_forever(on_started=report_started))
     except RunnerLockError as exc:
         print(f"error: {exc}")
         return 1

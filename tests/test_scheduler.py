@@ -1,4 +1,6 @@
 import asyncio
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -705,6 +707,61 @@ async def test_runner_lock_refuses_second_runner(app_config: AppConfig) -> None:
     assert not (app_config.runtime_dir / "runner.lock").exists()
 
 
+def test_runner_recovers_stale_dead_pid_lock(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config)
+    lock_path = app_config.runtime_dir / "runner.lock"
+    lock_path.write_text("pid=999999\n", encoding="ascii")
+    runner = Runner(app_config, repo, lambda: FakePublisher())
+    monkeypatch.setattr(runner, "_pid_is_alive", lambda pid: False)
+
+    runner.acquire_lock()
+    try:
+        assert lock_path.read_text(encoding="ascii") == f"pid={os.getpid()}\n"
+    finally:
+        runner.release_lock()
+
+    assert not lock_path.exists()
+
+
+def test_stale_lock_recovery_race_has_exactly_one_winner(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config)
+    lock_path = app_config.runtime_dir / "runner.lock"
+    lock_path.write_text("pid=999999\n", encoding="ascii")
+    runners = [
+        Runner(app_config, repo, lambda: FakePublisher()),
+        Runner(app_config, repo, lambda: FakePublisher()),
+    ]
+    for runner in runners:
+        monkeypatch.setattr(
+            runner,
+            "_pid_is_alive",
+            lambda pid: pid == os.getpid(),
+        )
+
+    def attempt(runner: Runner) -> str:
+        try:
+            runner.acquire_lock()
+        except RunnerLockError:
+            return "blocked"
+        return "acquired"
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, runners))
+        assert sorted(results) == ["acquired", "blocked"]
+    finally:
+        for runner in runners:
+            runner.release_lock()
+
+    assert not lock_path.exists()
+
+
 @pytest.mark.asyncio
 async def test_runner_releases_lock_on_normal_exit(app_config: AppConfig) -> None:
     repo = repository_with(app_config)
@@ -738,6 +795,28 @@ async def test_runner_releases_lock_when_loop_raises(app_config: AppConfig) -> N
 
     assert not (app_config.runtime_dir / "runner.lock").exists()
     assert runner.scheduler.state == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_releases_lock_when_shutdown_raises(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config)
+    runner = Runner(app_config, repo, lambda: FakePublisher())
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    def fail_shutdown(wait: bool = False) -> None:
+        del wait
+        raise RuntimeError("shutdown failed")
+
+    monkeypatch.setattr(runner.scheduler, "shutdown", fail_shutdown)
+
+    with pytest.raises(RuntimeError, match="shutdown failed"):
+        await runner.run_forever(stop_event=stop_event)
+
+    assert not (app_config.runtime_dir / "runner.lock").exists()
 
 
 @pytest.mark.asyncio
@@ -789,3 +868,49 @@ async def test_run_forever_recovers_before_exiting(app_config: AppConfig) -> Non
     job = repo.get_job("publishing")
     assert job is not None
     assert job.status is JobStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_real_scheduler_awaits_production_executor(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config, approved_job(seconds_from_now=0.3))
+    fake = FakePublisher()
+    stop_event = asyncio.Event()
+    monkeypatch.setattr(
+        "weibo_publisher.scheduler.SCAN_INTERVAL_SECONDS",
+        0.01,
+    )
+
+    async def wait_for_publication(delay: float) -> None:
+        assert delay == 0.01
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2
+        while loop.time() < deadline:
+            job = repo.get_job("job-1")
+            if (
+                job is not None
+                and job.status is JobStatus.PUBLISHED
+                and fake.close_calls == 1
+            ):
+                stop_event.set()
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail("APScheduler did not await JobExecutor.execute()")
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: fake,
+        sleep=wait_for_publication,
+    )
+
+    await runner.run_forever(stop_event=stop_event)
+
+    job = repo.get_job("job-1")
+    assert job is not None
+    assert job.status is JobStatus.PUBLISHED
+    assert fake.prepare_calls == 1
+    assert fake.submit_calls == 1
+    assert fake.close_calls == 1

@@ -341,11 +341,14 @@ def test_run_reports_startup_and_lock_collision(
         def __init__(self, config, repo, publisher_factory) -> None:
             del config, repo, publisher_factory
 
-        async def run_forever(self) -> None:
+        async def run_forever(self, *, on_started=None) -> None:
             calls.append("run")
+            assert on_started is not None
+            on_started()
 
     class BlockedRunner(FakeRunner):
-        async def run_forever(self) -> None:
+        async def run_forever(self, *, on_started=None) -> None:
+            del on_started
             raise RunnerLockError("runner is already running")
 
     monkeypatch.setattr("weibo_publisher.cli.Runner", FakeRunner)
@@ -355,4 +358,26 @@ def test_run_reports_startup_and_lock_collision(
 
     monkeypatch.setattr("weibo_publisher.cli.Runner", BlockedRunner)
     assert main(["run"]) == 1
-    assert "already running" in capsys.readouterr().out
+    blocked_out = capsys.readouterr().out
+    assert "already running" in blocked_out
+    assert "Runner started" not in blocked_out
+
+
+def test_run_reports_runner_construction_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class BrokenRunner:
+        def __init__(self, config, repo, publisher_factory) -> None:
+            del config, repo, publisher_factory
+            raise RuntimeError("construction failed")
+
+    monkeypatch.setattr("weibo_publisher.cli.Runner", BrokenRunner)
+
+    assert main(["run"]) == 1
+    output = capsys.readouterr().out
+    assert "runner stopped unexpectedly" in output
+    assert "Runner started" not in output

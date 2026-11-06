@@ -24,6 +24,7 @@ from weibo_publisher.repository import JobRepository
 from weibo_publisher.validation import build_fingerprint, validate_images
 
 SCAN_INTERVAL_SECONDS = 5
+LOCK_ACQUIRE_ATTEMPTS = 3
 
 
 class RunnerLockError(RuntimeError):
@@ -291,22 +292,31 @@ class Runner:
 
     def acquire_lock(self) -> None:
         self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            lock_fd = os.open(
-                self._lock_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                0o600,
-            )
-        except FileExistsError as exc:
-            raise RunnerLockError(
-                f"Another runner is already running for {self.config.root}"
-            ) from exc
-        self._lock_fd = lock_fd
-        try:
-            os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
-        except BaseException:
-            self.release_lock()
-            raise
+        for _ in range(LOCK_ACQUIRE_ATTEMPTS):
+            try:
+                lock_fd = os.open(
+                    self._lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                if self._remove_stale_lock():
+                    continue
+                raise RunnerLockError(
+                    f"Another runner is already running for {self.config.root}"
+                )
+
+            self._lock_fd = lock_fd
+            try:
+                os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
+            except BaseException:
+                self.release_lock()
+                raise
+            return
+
+        raise RunnerLockError(
+            f"Another runner is already running for {self.config.root}"
+        )
 
     def release_lock(self) -> None:
         lock_fd = self._lock_fd
@@ -383,22 +393,29 @@ class Runner:
         self,
         *,
         stop_event: asyncio.Event | None = None,
+        on_started: Callable[[], object] | None = None,
     ) -> None:
         self.acquire_lock()
         try:
             await self.recover_interrupted()
             self.scheduler.start()
+            if on_started is not None:
+                started = on_started()
+                if inspect.isawaitable(started):
+                    await started
             while stop_event is None or not stop_event.is_set():
                 await self.scan_once()
                 await self.sleep(SCAN_INTERVAL_SECONDS)
         finally:
             try:
-                self.scheduler.shutdown(wait=False)
-            except SchedulerNotRunningError:
-                pass
-            else:
-                await asyncio.sleep(0)
-            self.release_lock()
+                try:
+                    self.scheduler.shutdown(wait=False)
+                except SchedulerNotRunningError:
+                    pass
+                else:
+                    await asyncio.sleep(0)
+            finally:
+                self.release_lock()
 
     def _remove_inactive_jobs(self, approved_jobs: dict[str, Job]) -> None:
         for job_id in list(self._scheduled_job_ids):
@@ -425,7 +442,101 @@ class Runner:
             self.repo,
             self.publisher_factory,
         )
-        return lambda: executor.execute(job_id)
+
+        async def execute_job() -> None:
+            await executor.execute(job_id)
+
+        return execute_job
+
+    def _remove_stale_lock(self) -> bool:
+        try:
+            lock_pid = self._read_lock_pid()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if lock_pid is None or lock_pid <= 0 or self._pid_is_alive(lock_pid):
+            return False
+
+        try:
+            current_pid = self._read_lock_pid()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if current_pid != lock_pid:
+            return False
+
+        try:
+            self._lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        return True
+
+    def _read_lock_pid(self) -> int | None:
+        content = self._lock_path.read_text(encoding="ascii").strip()
+        value = content.removeprefix("pid=")
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    def _pid_is_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            return self._windows_pid_is_alive(pid)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+
+    def _windows_pid_is_alive(self, pid: int) -> bool:
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        error_access_denied = 5
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return ctypes.get_last_error() == error_access_denied
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(
+                handle,
+                ctypes.byref(exit_code),
+            ):
+                return True
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
 
     def _now(self) -> datetime:
         now = self.clock()
