@@ -1,6 +1,7 @@
 import asyncio
-import os
-from concurrent.futures import ThreadPoolExecutor
+import subprocess
+import sys
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -692,8 +693,25 @@ async def test_scan_removes_job_that_is_no_longer_approved(
     assert removed == ["job:job-1"]
 
 
-@pytest.mark.asyncio
-async def test_runner_lock_refuses_second_runner(app_config: AppConfig) -> None:
+def test_runner_acquires_persistent_lock_with_no_os_lock(
+    app_config: AppConfig,
+) -> None:
+    repo = repository_with(app_config)
+    lock_path = app_config.runtime_dir / "runner.lock"
+    lock_path.write_bytes(b"stale contents")
+    runner = Runner(app_config, repo, lambda: FakePublisher())
+
+    runner.acquire_lock()
+    try:
+        assert runner._lock_file is not None
+    finally:
+        runner.release_lock()
+
+    assert lock_path.exists()
+    assert lock_path.read_bytes() == b"stale contents"
+
+
+def test_runner_lock_rejects_second_live_holder(app_config: AppConfig) -> None:
     repo = repository_with(app_config)
     first = Runner(app_config, repo, lambda: FakePublisher())
     second = Runner(app_config, repo, lambda: FakePublisher())
@@ -704,62 +722,81 @@ async def test_runner_lock_refuses_second_runner(app_config: AppConfig) -> None:
     finally:
         first.release_lock()
 
-    assert not (app_config.runtime_dir / "runner.lock").exists()
 
-
-def test_runner_recovers_stale_dead_pid_lock(
+def test_runner_lock_release_is_idempotent_and_releases_os_lock(
     app_config: AppConfig,
-    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository_with(app_config)
+    first = Runner(app_config, repo, lambda: FakePublisher())
+    second = Runner(app_config, repo, lambda: FakePublisher())
+    first.acquire_lock()
+    first.release_lock()
+    first.release_lock()
+    try:
+        second.acquire_lock()
+    finally:
+        second.release_lock()
+
+    assert (app_config.runtime_dir / "runner.lock").exists()
+
+
+def test_os_lock_is_released_when_holding_process_is_killed(
+    app_config: AppConfig,
 ) -> None:
     repo = repository_with(app_config)
     lock_path = app_config.runtime_dir / "runner.lock"
-    lock_path.write_text("pid=999999\n", encoding="ascii")
+    lock_script = """
+import os
+import sys
+
+lock_path = sys.argv[1]
+lock_file = open(lock_path, "a+b")
+lock_file.seek(0, os.SEEK_END)
+if lock_file.tell() == 0:
+    lock_file.write(b"\\0")
+    lock_file.flush()
+lock_file.seek(0)
+if os.name == "nt":
+    import msvcrt
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+else:
+    import fcntl
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("locked", flush=True)
+sys.stdin.read()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", lock_script, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     runner = Runner(app_config, repo, lambda: FakePublisher())
-    monkeypatch.setattr(runner, "_pid_is_alive", lambda pid: False)
-
-    runner.acquire_lock()
     try:
-        assert lock_path.read_text(encoding="ascii") == f"pid={os.getpid()}\n"
-    finally:
-        runner.release_lock()
-
-    assert not lock_path.exists()
-
-
-def test_stale_lock_recovery_race_has_exactly_one_winner(
-    app_config: AppConfig,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo = repository_with(app_config)
-    lock_path = app_config.runtime_dir / "runner.lock"
-    lock_path.write_text("pid=999999\n", encoding="ascii")
-    runners = [
-        Runner(app_config, repo, lambda: FakePublisher()),
-        Runner(app_config, repo, lambda: FakePublisher()),
-    ]
-    for runner in runners:
-        monkeypatch.setattr(
-            runner,
-            "_pid_is_alive",
-            lambda pid: pid == os.getpid(),
-        )
-
-    def attempt(runner: Runner) -> str:
-        try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "locked"
+        with pytest.raises(RunnerLockError, match="already running"):
             runner.acquire_lock()
-        except RunnerLockError:
-            return "blocked"
-        return "acquired"
 
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(attempt, runners))
-        assert sorted(results) == ["acquired", "blocked"]
+        process.kill()
+        process.wait(timeout=5)
+
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                runner.acquire_lock()
+            except RunnerLockError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+            else:
+                break
     finally:
-        for runner in runners:
-            runner.release_lock()
-
-    assert not lock_path.exists()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        runner.release_lock()
 
 
 @pytest.mark.asyncio
@@ -771,7 +808,9 @@ async def test_runner_releases_lock_on_normal_exit(app_config: AppConfig) -> Non
 
     await runner.run_forever(stop_event=stop_event)
 
-    assert not (app_config.runtime_dir / "runner.lock").exists()
+    replacement = Runner(app_config, repo, lambda: FakePublisher())
+    replacement.acquire_lock()
+    replacement.release_lock()
     assert runner.scheduler.state == 0
 
 
@@ -793,7 +832,9 @@ async def test_runner_releases_lock_when_loop_raises(app_config: AppConfig) -> N
     with pytest.raises(RuntimeError, match="stop after first scan"):
         await runner.run_forever()
 
-    assert not (app_config.runtime_dir / "runner.lock").exists()
+    replacement = Runner(app_config, repo, lambda: FakePublisher())
+    replacement.acquire_lock()
+    replacement.release_lock()
     assert runner.scheduler.state == 0
 
 
@@ -816,7 +857,9 @@ async def test_runner_releases_lock_when_shutdown_raises(
     with pytest.raises(RuntimeError, match="shutdown failed"):
         await runner.run_forever(stop_event=stop_event)
 
-    assert not (app_config.runtime_dir / "runner.lock").exists()
+    replacement = Runner(app_config, repo, lambda: FakePublisher())
+    replacement.acquire_lock()
+    replacement.release_lock()
 
 
 @pytest.mark.asyncio

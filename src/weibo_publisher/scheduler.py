@@ -5,6 +5,7 @@ import inspect
 import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from typing import BinaryIO
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -24,7 +25,7 @@ from weibo_publisher.repository import JobRepository
 from weibo_publisher.validation import build_fingerprint, validate_images
 
 SCAN_INTERVAL_SECONDS = 5
-LOCK_ACQUIRE_ATTEMPTS = 3
+LOCK_BYTE_COUNT = 1
 
 
 class RunnerLockError(RuntimeError):
@@ -288,45 +289,86 @@ class Runner:
         self._scheduled_job_ids: set[str] = set()
         self.scheduled = self._scheduled_job_ids
         self._lock_path = config.runtime_dir / "runner.lock"
-        self._lock_fd: int | None = None
+        self._lock_file: BinaryIO | None = None
 
     def acquire_lock(self) -> None:
+        if self._lock_file is not None:
+            raise RunnerLockError(
+                f"Runner lock is already held by this process for {self.config.root}"
+            )
         self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
-        for _ in range(LOCK_ACQUIRE_ATTEMPTS):
+        lock_file: BinaryIO | None = None
+        try:
+            lock_file = self._lock_path.open("a+b")
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            self._acquire_os_lock(lock_file)
+        except BaseException:
+            if lock_file is not None:
+                try:
+                    lock_file.close()
+                except OSError:
+                    pass
+            raise
+        self._lock_file = lock_file
+
+    def _acquire_os_lock(self, lock_file: BinaryIO) -> None:
+        if os.name == "nt":
+            import msvcrt
+
             try:
-                lock_fd = os.open(
-                    self._lock_path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
+                msvcrt.locking(
+                    lock_file.fileno(),
+                    msvcrt.LK_NBLCK,
+                    LOCK_BYTE_COUNT,
                 )
-            except FileExistsError:
-                if self._remove_stale_lock():
-                    continue
+            except OSError as exc:
                 raise RunnerLockError(
                     f"Another runner is already running for {self.config.root}"
-                )
-
-            self._lock_fd = lock_fd
-            try:
-                os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
-            except BaseException:
-                self.release_lock()
-                raise
+                ) from exc
             return
 
-        raise RunnerLockError(
-            f"Another runner is already running for {self.config.root}"
-        )
+        import fcntl
+
+        try:
+            fcntl.flock(
+                lock_file.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except OSError as exc:
+            raise RunnerLockError(
+                f"Another runner is already running for {self.config.root}"
+            ) from exc
 
     def release_lock(self) -> None:
-        lock_fd = self._lock_fd
-        if lock_fd is None:
+        lock_file = self._lock_file
+        if lock_file is None:
             return
-        self._lock_fd = None
+        self._lock_file = None
         try:
-            os.close(lock_fd)
+            lock_file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(
+                    lock_file.fileno(),
+                    msvcrt.LK_UNLCK,
+                    LOCK_BYTE_COUNT,
+                )
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
         finally:
-            self._lock_path.unlink(missing_ok=True)
+            try:
+                lock_file.close()
+            except OSError:
+                pass
 
     async def scan_once(self) -> None:
         approved_jobs = {
@@ -447,96 +489,6 @@ class Runner:
             await executor.execute(job_id)
 
         return execute_job
-
-    def _remove_stale_lock(self) -> bool:
-        try:
-            lock_pid = self._read_lock_pid()
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
-        if lock_pid is None or lock_pid <= 0 or self._pid_is_alive(lock_pid):
-            return False
-
-        try:
-            current_pid = self._read_lock_pid()
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
-        if current_pid != lock_pid:
-            return False
-
-        try:
-            self._lock_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return False
-        return True
-
-    def _read_lock_pid(self) -> int | None:
-        content = self._lock_path.read_text(encoding="ascii").strip()
-        value = content.removeprefix("pid=")
-        try:
-            return int(value)
-        except ValueError:
-            return None
-
-    def _pid_is_alive(self, pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if os.name == "nt":
-            return self._windows_pid_is_alive(pid)
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return True
-        return True
-
-    def _windows_pid_is_alive(self, pid: int) -> bool:
-        import ctypes
-        from ctypes import wintypes
-
-        process_query_limited_information = 0x1000
-        error_access_denied = 5
-        still_active = 259
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [
-            wintypes.DWORD,
-            wintypes.BOOL,
-            wintypes.DWORD,
-        ]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetExitCodeProcess.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        handle = kernel32.OpenProcess(
-            process_query_limited_information,
-            False,
-            pid,
-        )
-        if not handle:
-            return ctypes.get_last_error() == error_access_denied
-        try:
-            exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(
-                handle,
-                ctypes.byref(exit_code),
-            ):
-                return True
-            return exit_code.value == still_active
-        finally:
-            kernel32.CloseHandle(handle)
 
     def _now(self) -> datetime:
         now = self.clock()

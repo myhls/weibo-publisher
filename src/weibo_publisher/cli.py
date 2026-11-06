@@ -364,13 +364,16 @@ def _cmd_preview(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    repo, config = _repository_from_args(args)
-    configure_logging(config)
+    started = False
 
     def report_started() -> None:
+        nonlocal started
+        started = True
         print("Runner started. Press Ctrl+C to stop.")
 
     try:
+        repo, config = _repository_from_args(args)
+        configure_logging(config)
         from weibo_publisher.weibo import WeiboPublisher
 
         runner = Runner(
@@ -386,8 +389,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("Runner stopped.")
         return 0
     except Exception:
-        logging.getLogger(__name__).exception("Runner stopped unexpectedly")
-        print("error: runner stopped unexpectedly")
+        if started:
+            logging.getLogger(__name__).exception("Runner stopped unexpectedly")
+            print("error: runner stopped unexpectedly")
+        else:
+            print("error: runner failed to start")
         return 1
 
     print("Runner stopped.")

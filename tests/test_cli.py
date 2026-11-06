@@ -379,5 +379,50 @@ def test_run_reports_runner_construction_failure(
 
     assert main(["run"]) == 1
     output = capsys.readouterr().out
-    assert "runner stopped unexpectedly" in output
+    assert "runner failed to start" in output
     assert "Runner started" not in output
+
+
+def test_run_controls_repository_setup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    def fail_repository(args):
+        del args
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "weibo_publisher.cli._repository_from_args",
+        fail_repository,
+    )
+
+    assert main(["run"]) == 1
+    captured = capsys.readouterr()
+    assert "runner failed to start" in captured.out
+    assert "Runner started" not in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_run_controls_logging_setup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        "weibo_publisher.cli._repository_from_args",
+        lambda args: (object(), object()),
+    )
+
+    def fail_logging(config) -> None:
+        del config
+        raise RuntimeError("logging unavailable")
+
+    monkeypatch.setattr(
+        "weibo_publisher.cli.configure_logging",
+        fail_logging,
+    )
+
+    assert main(["run"]) == 1
+    captured = capsys.readouterr()
+    assert "runner failed to start" in captured.out
+    assert "Runner started" not in captured.out
+    assert "Traceback" not in captured.err
