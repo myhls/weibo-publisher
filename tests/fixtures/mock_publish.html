@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+  <body>
+    <textarea id="text"></textarea>
+    <input id="image" type="file" accept="image/*">
+    <button id="publish" type="button">发布</button>
+    <script>
+      document.querySelector("#publish").addEventListener("click", () => {
+        window.publishClickCount = (window.publishClickCount ?? 0) + 1;
+        document.body.dataset.published = "true";
+      });
+    </script>
+  </body>
+</html>
