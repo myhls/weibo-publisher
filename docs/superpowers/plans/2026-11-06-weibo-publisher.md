@@ -998,6 +998,7 @@ git commit -m "feat: persist jobs and atomic transitions"
 - [ ] **Step 1: Write failing CLI tests**
 
 ```python
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1009,6 +1010,7 @@ def test_add_creates_draft_and_confirm_approves(tmp_path: Path, monkeypatch) -> 
     image = tmp_path / "image.jpg"
     image.write_bytes(b"jpeg")
     monkeypatch.chdir(tmp_path)
+    future = datetime.now(timezone.utc) + timedelta(days=1)
 
     add_code = main(
         [
@@ -1018,7 +1020,7 @@ def test_add_creates_draft_and_confirm_approves(tmp_path: Path, monkeypatch) -> 
             "--image",
             str(image),
             "--at",
-            "2026-11-07T17:30:00+08:00",
+            future.isoformat(),
         ]
     )
     assert add_code == 0
@@ -1042,6 +1044,7 @@ def test_confirm_rejects_missing_image(tmp_path: Path, monkeypatch, capsys) -> N
     image = tmp_path / "image.jpg"
     image.write_bytes(b"jpeg")
     monkeypatch.chdir(tmp_path)
+    future = datetime.now(timezone.utc) + timedelta(days=1)
     main(
         [
             "add",
@@ -1050,7 +1053,7 @@ def test_confirm_rejects_missing_image(tmp_path: Path, monkeypatch, capsys) -> N
             "--image",
             str(image),
             "--at",
-            "2026-11-07T17:30:00+08:00",
+            future.isoformat(),
         ]
     )
     image.unlink()
