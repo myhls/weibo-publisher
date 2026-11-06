@@ -1,0 +1,14 @@
+[app]
+browser_channel = "msedge"
+headless = false
+default_timezone = "Asia/Shanghai"
+
+[publishing]
+prepare_lead_seconds = 180
+late_cutoff_seconds = 30
+daily_limit = 100
+minimum_gap_seconds = 240
+allow_over_limit = false
+
+[storage]
+artifact_retention_days = 30
