@@ -1,3 +1,4 @@
+import base64
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,6 +22,10 @@ from weibo_publisher.models import (
 from weibo_publisher.weibo import WeiboPublisher, parse_publish_response
 
 _PUBLISH_URL = "https://weibo.com/ajax/statuses/update"
+_PREVIEW_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def test_parse_success_response() -> None:
@@ -454,6 +459,10 @@ def _routed_context_factory(
                 _PUBLISH_URL,
                 _publish_route(response_payload, observed),
             )
+            await context.route(
+                "https://wx*.sinaimg.cn/**",
+                _preview_image_route,
+            )
             await context.new_page()
             try:
                 yield context
@@ -481,6 +490,15 @@ def _page_html(*, sends_post: bool) -> str:
           <button id="publish" type="button">发布</button>
         </main>
         <script>
+          document.querySelector("#image").addEventListener("change", (event) => {{
+            for (const file of Array.from(event.target.files ?? [])) {{
+              const image = document.createElement("img");
+              image.className = "woo-picture-img";
+              image.src =
+                `https://wx2.sinaimg.cn/large/${{encodeURIComponent(file.name)}}`;
+              event.target.parentElement.appendChild(image);
+            }}
+          }});
           document.querySelector("#publish").addEventListener("click", () => {{
             window.publishClickCount = (window.publishClickCount ?? 0) + 1;
             {post_request}
@@ -500,6 +518,14 @@ def _html_route(body: str):
         )
 
     return fulfill
+
+
+async def _preview_image_route(route) -> None:
+    await route.fulfill(
+        status=200,
+        content_type="image/png",
+        body=_PREVIEW_PNG_BYTES,
+    )
 
 
 def _publish_route(

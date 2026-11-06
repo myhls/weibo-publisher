@@ -1,3 +1,4 @@
+import base64
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -331,9 +332,36 @@ _PUBLISH_TRIPWIRE = """
 </script>
 """
 
+_PREVIEW_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+_IMAGE_PREVIEW_SCRIPT = """
+<script>
+  window.addEventListener("DOMContentLoaded", () => {
+    const input = document.querySelector("#image-input");
+    if (!input) return;
+    input.addEventListener("change", () => {
+      for (const file of Array.from(input.files ?? [])) {
+        const image = document.createElement("img");
+        image.className = "woo-picture-img";
+        image.src =
+          `https://wx2.sinaimg.cn/large/${encodeURIComponent(file.name)}`;
+        input.parentElement.appendChild(image);
+      }
+    });
+  });
+</script>
+"""
+
 
 def _html(body: str, script: str = "") -> str:
-    return f"<!doctype html><html><head>{script}</head><body>{body}</body></html>"
+    return (
+        "<!doctype html><html><head>"
+        f"{script}{_IMAGE_PREVIEW_SCRIPT}"
+        f"</head><body>{body}</body></html>"
+    )
 
 
 def _local_config(config: AppConfig) -> AppConfig:
@@ -355,6 +383,10 @@ def _observing_routed_context_factory(
             context = await chrome.new_context()
             for url, body in routes.items():
                 await context.route(url, _html_route(body))
+            await context.route(
+                "https://wx*.sinaimg.cn/**",
+                _preview_image_route,
+            )
             page = await context.new_page()
             page_errors: list[str] = []
             page.on("pageerror", lambda error: page_errors.append(str(error)))
@@ -411,6 +443,14 @@ def _html_route(body: str):
         )
 
     return fulfill
+
+
+async def _preview_image_route(route) -> None:
+    await route.fulfill(
+        status=200,
+        content_type="image/png",
+        body=_PREVIEW_PNG_BYTES,
+    )
 
 
 def _job(

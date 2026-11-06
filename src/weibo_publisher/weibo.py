@@ -55,6 +55,8 @@ _UPLOAD_INDICATOR_SELECTORS = (
 )
 _UPLOAD_TIMEOUT_SECONDS = 5.0
 _UPLOAD_POLL_INTERVAL_SECONDS = 0.1
+_PREVIEW_IMAGE_TIMEOUT_SECONDS = 30.0
+_PREVIEW_IMAGE_POLL_INTERVAL_SECONDS = 0.2
 _PUBLISH_RESPONSE_TIMEOUT_MS = 30_000
 _PUBLISH_ENDPOINT = "/ajax/statuses/update"
 _PUBLIC_VISIBILITY_LABELS = frozenset({"公开", "公开可见", "所有人可见"})
@@ -232,6 +234,7 @@ async def _prepare_page(
         image_input = await _first_present(page, IMAGE_INPUT_SELECTORS)
         await image_input.set_input_files([str(image) for image in images])
         await _wait_for_uploads(page)
+        await _wait_for_uploaded_image_previews(page, len(images))
 
     await page.screenshot(
         path=str(artifact_dir / "preview.png"),
@@ -311,6 +314,130 @@ async def _wait_for_uploads(page: Page) -> None:
         if remaining <= 0:
             raise RuntimeError("Image upload did not complete before timeout")
         await asyncio.sleep(min(_UPLOAD_POLL_INTERVAL_SECONDS, remaining))
+
+
+async def _wait_for_uploaded_image_previews(
+    page: Page,
+    expected_count: int,
+    *,
+    timeout_seconds: float | None = None,
+) -> None:
+    if expected_count <= 0:
+        return
+
+    composer = await first_visible(page, TEXT_SELECTORS)
+    wait_seconds = (
+        _PREVIEW_IMAGE_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    deadline = time.monotonic() + max(wait_seconds, 0)
+    loaded_count = 0
+    while True:
+        loaded_count = await _count_loaded_composer_previews(composer)
+        if loaded_count >= expected_count:
+            return
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Expected {expected_count} uploaded image preview(s) in the "
+                f"composer, but only {loaded_count} loaded before timeout"
+            )
+        await asyncio.sleep(min(_PREVIEW_IMAGE_POLL_INTERVAL_SECONDS, remaining))
+
+
+async def _count_loaded_composer_previews(composer: Locator) -> int:
+    raw_count = await composer.evaluate(
+        """
+        (composer) => {
+          const normalize = (value) =>
+            String(value ?? "").replace(/\\s+/g, " ").trim();
+          const publicLabels = new Set(["公开", "公开可见", "所有人可见"]);
+          const publishWords = ["发布", "发送"];
+          const hasPublishControl = (root) => {
+            const controls = root.querySelectorAll(
+              'button, a, [role="button"], [class*="submit"]'
+            );
+            for (const control of controls) {
+              if (!(control instanceof HTMLElement)) {
+                continue;
+              }
+              const labels = [
+                normalize(control.innerText || control.textContent || ""),
+                normalize(control.getAttribute("aria-label") || ""),
+              ];
+              if (
+                labels.some((label) =>
+                  publishWords.some((word) => label.includes(word))
+                )
+              ) {
+                return true;
+              }
+            }
+            return false;
+          };
+          const hasPublicVisibilityLabel = (root) => {
+            const controls = root.querySelectorAll(
+              '[data-testid="visibility"], [data-visibility], ' +
+              '[aria-label*="可见"], button, [role="button"], ' +
+              '[class*="visibility"]'
+            );
+            for (const control of controls) {
+              if (!(control instanceof HTMLElement)) {
+                continue;
+              }
+              const labels = [
+                normalize(control.innerText || control.textContent || ""),
+                normalize(control.getAttribute("aria-label") || ""),
+                normalize(control.getAttribute("data-visibility") || ""),
+              ];
+              if (labels.some((label) => publicLabels.has(label))) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          let root = composer.parentElement;
+          while (
+            root &&
+            root !== document.body &&
+            root !== document.documentElement &&
+            !hasPublishControl(root) &&
+            !hasPublicVisibilityLabel(root)
+          ) {
+            root = root.parentElement;
+          }
+          if (!root || root === document.body || root === document.documentElement) {
+            return 0;
+          }
+
+          const images = root.querySelectorAll('img[class*="woo-picture-img"]');
+          let count = 0;
+          for (const image of images) {
+            let url;
+            try {
+              url = new URL(image.src, document.baseURI);
+            } catch {
+              continue;
+            }
+            if (
+              url.protocol === "https:" &&
+              /^wx[^.]*\\.sinaimg\\.cn$/i.test(url.hostname) &&
+              image.complete === true &&
+              image.naturalWidth > 0
+            ) {
+              count += 1;
+            }
+          }
+          return count;
+        }
+        """
+    )
+    if isinstance(raw_count, bool) or not isinstance(raw_count, int):
+        raise TypeError("composer preview count was not an integer")
+    return raw_count
 
 
 async def _validate_submit_page(
