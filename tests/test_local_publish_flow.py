@@ -26,7 +26,8 @@ class LocalFilePublisher:
         self.published = False
         self.click_count = 0
         self.clicks_after_prepare = 0
-        self.clicked_at = None
+        self.prepared_at = None
+        self.submit_invoked_at = None
         self.request_urls: list[str] = []
         self.blocked_network_urls: list[str] = []
 
@@ -54,10 +55,11 @@ class LocalFilePublisher:
         self.clicks_after_prepare = await self.page.evaluate(
             "window.publishClickCount ?? 0"
         )
+        self.prepared_at = datetime.now(UTC)
 
     async def submit(self, job, artifact_dir):
         del job, artifact_dir
-        self.clicked_at = datetime.now(UTC)
+        self.submit_invoked_at = datetime.now(UTC)
         await self.page.click("#publish")
         await self.page.wait_for_function(
             "document.body.dataset.published === 'true'"
@@ -84,7 +86,7 @@ class LocalFilePublisher:
 def make_approved_job(tmp_path: Path) -> Job:
     image = tmp_path / "image.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\nlocal-e2e")
-    publish_at = datetime.now(UTC) + timedelta(seconds=1)
+    publish_at = datetime.now(UTC) + timedelta(seconds=5)
     return Job(
         id="job-local-1",
         text="可爱",
@@ -164,8 +166,10 @@ async def test_executor_publishes_once_records_result_and_stays_local(
     assert publisher.clicks_after_prepare == 0
     assert publisher.click_count == 1
     assert publisher.published is True
-    assert publisher.clicked_at is not None
-    assert publisher.clicked_at >= job.publish_at_utc
+    assert publisher.prepared_at is not None
+    assert publisher.prepared_at < job.publish_at_utc
+    assert publisher.submit_invoked_at is not None
+    assert publisher.submit_invoked_at >= job.publish_at_utc
     assert publisher.blocked_network_urls == []
     assert publisher.request_urls
     assert all(url.startswith("file:") for url in publisher.request_urls)
