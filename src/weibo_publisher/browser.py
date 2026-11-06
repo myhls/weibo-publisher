@@ -10,44 +10,59 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from urllib.parse import unquote, urlparse
-
-from playwright.async_api import BrowserContext, Page, async_playwright
-from playwright.async_api import Error as PlaywrightError
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from weibo_publisher.config import AppConfig, ensure_runtime_dirs
-from weibo_publisher.repository import JobRepository
+
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext, Page
 
 LOGIN_URL = "https://passport.weibo.com/sso/signin"
 HOME_URL = "https://weibo.com/"
 
 _DEFAULT_LOGIN_TIMEOUT_SECONDS = 300.0
 _DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+_SESSION_WAIT_TIMEOUT_SECONDS = 5.0
+_SESSION_POLL_INTERVAL_SECONDS = 0.2
 _NAVIGATION_TIMEOUT_MS = 30_000
-_BLOCKED_URL_MARKERS = (
-    "passport",
-    "login",
-    "signin",
-    "verify",
-    "verification",
-    "captcha",
-    "challenge",
-    "visitor.weibo",
+_ALLOWED_SESSION_HOSTS = frozenset({"weibo.com", "www.weibo.com"})
+_BLOCKED_HOST_MARKERS = ("passport.weibo.com", "visitor.weibo.com")
+_BLOCKED_PATH_MARKERS = (
+    "/login",
+    "/signin",
+    "/verify",
+    "/verification",
+    "/captcha",
+    "/challenge",
 )
 _BLOCKED_SELECTORS = (
     'form[action*="login"]',
     'form[action*="signin"]',
+    'form[action*="passport.weibo"]',
     "#captcha",
-    '[id*="captcha"]',
-    '[class*="captcha"]',
-    '[id*="verify"]',
-    '[class*="verify"]',
+    '[data-testid="captcha"]',
+    'iframe[src*="captcha"]',
+    '[class*="verifyDialog"]',
+    '[class*="verify_dialog"]',
+    '[class*="security-verify"]',
+    '[class*="security_verify"]',
+    '[role="dialog"]:has-text("安全验证")',
+    '[role="dialog"]:has-text("请输入验证码")',
+    '[role="dialog"]:has-text("完成验证")',
+    '[role="dialog"]:has-text("身份验证")',
+    '[role="dialog"]:has-text("访问过于频繁")',
 )
-_LOGGED_IN_SELECTORS = (
+_VERIFICATION_TITLES = (
+    "安全验证",
+    "微博验证",
+    "验证码",
+    "身份验证",
+    "访问异常",
+    "访问过于频繁",
+)
+_AUTHENTICATED_SELECTORS = (
     '[class*="gn_name"]',
-    'header a[href*="/u/"]',
-    'a[href*="/u/"][class*="name"]',
 )
 
 logger = logging.getLogger(__name__)
@@ -58,6 +73,14 @@ class DoctorCheck:
     name: str
     ok: bool
     detail: str
+
+
+def _playwright_api():
+    return importlib.import_module("playwright.async_api")
+
+
+def async_playwright():
+    return _playwright_api().async_playwright()
 
 
 @asynccontextmanager
@@ -90,6 +113,7 @@ async def login(
     poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> bool:
     logger.info("Opening Weibo login in the dedicated browser profile")
+    playwright_error = _playwright_api().Error
     async with persistent_context(config) as context:
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(
@@ -105,7 +129,7 @@ async def login(
                     continue
                 try:
                     logged_in = await _logged_in(open_page)
-                except PlaywrightError:
+                except playwright_error:
                     continue
                 if logged_in:
                     logger.info("Weibo login detected")
@@ -119,7 +143,11 @@ async def login(
     return False
 
 
-async def check_session(config: AppConfig) -> bool:
+async def check_session(
+    config: AppConfig,
+    *,
+    timeout_seconds: float = _SESSION_WAIT_TIMEOUT_SECONDS,
+) -> bool:
     async with persistent_context(config) as context:
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(
@@ -127,28 +155,54 @@ async def check_session(config: AppConfig) -> bool:
             wait_until="domcontentloaded",
             timeout=_NAVIGATION_TIMEOUT_MS,
         )
-        valid = await _logged_in(page)
+        valid = await _wait_for_session(page, timeout_seconds)
     logger.info("Weibo session check: %s", "valid" if valid else "missing")
     return valid
 
 
 async def _logged_in(page: Page) -> bool:
+    return await _session_state(page) == "logged_in"
+
+
+async def _session_state(page: Page) -> str:
     parsed = urlparse(page.url)
-    if parsed.scheme == "file":
-        url_target = Path(unquote(parsed.path)).name.lower()
-    else:
-        url_target = f"{parsed.netloc}{parsed.path}{parsed.query}".lower()
-    if any(marker in url_target for marker in _BLOCKED_URL_MARKERS):
-        return False
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if (
+        parsed.scheme != "https"
+        or host not in _ALLOWED_SESSION_HOSTS
+        or any(marker in host for marker in _BLOCKED_HOST_MARKERS)
+        or any(marker in path for marker in _BLOCKED_PATH_MARKERS)
+    ):
+        return "blocked"
+
+    title = (await page.title()).lower()
+    if any(marker.lower() in title for marker in _VERIFICATION_TITLES):
+        return "blocked"
 
     for selector in _BLOCKED_SELECTORS:
         if await _has_visible_element(page, selector):
+            return "blocked"
+
+    for selector in _AUTHENTICATED_SELECTORS:
+        if await _has_visible_element(page, selector):
+            return "logged_in"
+    return "pending"
+
+
+async def _wait_for_session(page: Page, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + max(timeout_seconds, 0)
+    while True:
+        state = await _session_state(page)
+        if state == "logged_in":
+            return True
+        if state == "blocked":
             return False
 
-    for selector in _LOGGED_IN_SELECTORS:
-        if await _has_visible_element(page, selector):
-            return True
-    return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(_SESSION_POLL_INTERVAL_SECONDS, remaining))
 
 
 async def _has_visible_element(page: Page, selector: str) -> bool:
@@ -249,13 +303,15 @@ def _check_runtime_directories(config: AppConfig) -> DoctorCheck:
 
 
 def _check_database(config: AppConfig) -> DoctorCheck:
+    if not config.db_path.exists():
+        return DoctorCheck("Database", True, "not created yet")
     try:
-        JobRepository(config.db_path).initialize()
-        with sqlite3.connect(config.db_path) as connection:
+        database_uri = f"{config.db_path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(database_uri, uri=True) as connection:
             result = connection.execute("PRAGMA quick_check").fetchone()
         if not result or result[0] != "ok":
             return DoctorCheck("Database", False, "quick check failed")
     except (OSError, sqlite3.Error):
         logger.exception("Database diagnostic failed")
         return DoctorCheck("Database", False, "not accessible")
-    return DoctorCheck("Database", True, "schema accessible; quick check passed")
+    return DoctorCheck("Database", True, "read-only quick check passed")

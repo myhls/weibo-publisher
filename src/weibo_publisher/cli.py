@@ -8,7 +8,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from weibo_publisher.browser import login, run_doctor
 from weibo_publisher.config import ensure_runtime_dirs, load_config
 from weibo_publisher.logging_setup import configure_logging
 from weibo_publisher.models import Job, JobStatus, Visibility
@@ -155,6 +154,8 @@ def _cmd_login(args: argparse.Namespace) -> int:
     ensure_runtime_dirs(config)
     configure_logging(config)
     try:
+        from weibo_publisher.browser import login
+
         completed = asyncio.run(login(config))
     except Exception:
         logging.getLogger(__name__).exception("Weibo login command failed")
@@ -171,6 +172,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     ensure_runtime_dirs(config)
     configure_logging(config)
     try:
+        from weibo_publisher.browser import run_doctor
+
         checks = asyncio.run(run_doctor(config))
     except Exception:
         logging.getLogger(__name__).exception("Doctor command failed")
