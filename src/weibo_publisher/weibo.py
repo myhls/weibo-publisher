@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from weibo_publisher.browser import (
     _NAVIGATION_TIMEOUT_MS,
     _SESSION_WAIT_TIMEOUT_SECONDS,
@@ -78,6 +80,7 @@ _KNOWN_VISIBILITY_LABELS = (
 )
 _VISIBILITY_TIMEOUT_SECONDS = 3.0
 _VISIBILITY_POLL_INTERVAL_SECONDS = 0.1
+_VISIBILITY_PROBE_TIMEOUT_MS = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,9 +257,11 @@ async def _prepare_page(
     composer = await first_visible(page, TEXT_SELECTORS)
     tag_name = await composer.evaluate("(element) => element.tagName.toLowerCase()")
     contenteditable = await composer.get_attribute("contenteditable")
+    composer_region: Locator | None = None
     if tag_name == "textarea":
         await composer.fill(text)
     elif contenteditable == "true":
+        composer_region = await _active_composer_region(composer)
         await composer.click()
         await page.keyboard.insert_text(text)
     else:
@@ -268,7 +273,8 @@ async def _prepare_page(
         await _wait_for_uploads(page)
         await _wait_for_uploaded_image_previews(page, len(images))
 
-    composer_region = await _active_composer_region(composer)
+    if composer_region is None:
+        composer_region = await _active_composer_region(composer)
     await _ensure_visibility(composer_region, visibility)
 
     await page.screenshot(
@@ -299,10 +305,19 @@ async def _active_composer_region(composer: Locator) -> Locator:
         )
         if tag_name in {"body", "html"}:
             break
-        if await _has_visible_control(parent, PUBLISH_SELECTORS):
+        has_publish_control = await _has_visible_control(
+            parent,
+            PUBLISH_SELECTORS,
+        )
+        has_visibility_control = await _has_visible_visibility_control(parent)
+        if has_publish_control and has_visibility_control:
             return parent
         current = parent
-    raise RuntimeError("Active Weibo composer region could not be identified")
+    raise RuntimeError(
+        "Active Weibo composer region could not be identified: "
+        "no non-page ancestor contains both a visible publish control and "
+        "a visible visibility control; visibility could not be verified"
+    )
 
 
 async def _has_visible_control(
@@ -311,6 +326,18 @@ async def _has_visible_control(
 ) -> bool:
     for selector in selectors:
         locator = root.locator(selector)
+        for index in range(await locator.count()):
+            if await locator.nth(index).is_visible():
+                return True
+    return False
+
+
+async def _has_visible_visibility_control(root: Page | Locator) -> bool:
+    if await _has_visible_control(root, VISIBILITY_SELECTORS):
+        return True
+
+    for label in _KNOWN_VISIBILITY_LABELS:
+        locator = root.get_by_text(label, exact=True)
         for index in range(await locator.count()):
             if await locator.nth(index).is_visible():
                 return True
@@ -744,12 +771,35 @@ async def _first_visible_exact_text(
 
 
 async def _visibility_label_for(candidate: Locator) -> str | None:
-    values = [
-        await candidate.inner_text(),
-        await candidate.get_attribute("aria-label") or "",
-        await candidate.get_attribute("data-visibility") or "",
-    ]
+    try:
+        values = await candidate.evaluate(
+            """
+            (element) => [
+              element.innerText ?? "",
+              element.textContent ?? "",
+              element.getAttribute("aria-label") ?? "",
+              element.getAttribute("data-visibility") ?? "",
+            ]
+            """,
+            timeout=_VISIBILITY_PROBE_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError(
+            "Weibo visibility label could not be read within "
+            f"{_VISIBILITY_PROBE_TIMEOUT_MS}ms"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Weibo visibility label could not be read safely: {exc}"
+        ) from exc
+
+    if not isinstance(values, list):
+        raise RuntimeError(  # noqa: TRY004 - browser data must fail closed
+            "Weibo visibility label probe returned invalid data"
+        )
     for value in values:
+        if not isinstance(value, str):
+            continue
         label = normalize_text(value)
         if label in _KNOWN_VISIBILITY_LABELS:
             return label
