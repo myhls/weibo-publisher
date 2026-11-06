@@ -87,7 +87,7 @@ async def test_prepare_survives_repeated_visibility_control_rebuilds(
         snapshot = await weibo._read_visibility_snapshot(region)
 
         assert snapshot.label == "公开"
-        assert snapshot.trigger_marked is True
+        assert snapshot.has_trigger is True
         assert await page.evaluate("window.visibilityRebuildCount") >= 2
 
         artifact_dir = tmp_path / "artifacts"
@@ -108,21 +108,59 @@ async def test_prepare_survives_repeated_visibility_control_rebuilds(
 
 
 @pytest.mark.asyncio
-async def test_visibility_selection_fails_closed_before_control_appears(
+async def test_visibility_trigger_action_is_atomic_after_late_replacement(
+) -> None:
+    async with _local_page(_late_replacement_visibility_page_html()) as page:
+        region = page.locator("#composer-shell")
+
+        await weibo._ensure_visibility(region, Visibility.PRIVATE)
+        await asyncio.sleep(0)
+
+        assert await page.locator("#current-visibility").inner_text() == "仅自己可见"
+        assert await page.evaluate("window.triggerClicked") is True
+        assert await page.evaluate("window.triggerReplacementCount") >= 1
+
+
+@pytest.mark.asyncio
+async def test_visibility_option_ignores_same_label_interactive_decoy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(weibo, "_VISIBILITY_TIMEOUT_SECONDS", 0.5)
+    async with _local_page(_option_decoy_visibility_page_html()) as page:
+        region = page.locator("#composer-shell")
+
+        await weibo._ensure_visibility(region, Visibility.PUBLIC)
+
+        assert await page.locator("#visibility").inner_text() == "公开"
+        assert await page.evaluate("window.decoyClickCount ?? 0") == 0
+        assert await page.evaluate("window.optionClickCount") == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_fails_closed_before_control_appears(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(weibo, "_VISIBILITY_TIMEOUT_SECONDS", 0.3)
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
     async with _local_page(_stalled_visibility_page_html()) as page:
-        region = page.locator("#composer-shell")
         started = time.monotonic()
 
         with pytest.raises(RuntimeError, match="visibility"):
-            await weibo._ensure_visibility(region, Visibility.PRIVATE)
+            await weibo._prepare_page(
+                page,
+                "must not publish",
+                [],
+                Visibility.PRIVATE,
+                artifact_dir,
+            )
         elapsed = time.monotonic() - started
 
         assert elapsed < 2.0
         assert await page.evaluate("window.publishClickCount ?? 0") == 0
         assert await page.evaluate("window.editorClickCount ?? 0") == 0
+        assert not (artifact_dir / "preview.png").exists()
 
 
 @asynccontextmanager
@@ -307,6 +345,148 @@ def _stalled_visibility_page_html() -> str:
             <button id="publish" type="button">发送</button>
           </main>
           <script>
+            document.querySelector("#publish").addEventListener("click", () => {
+              window.publishClickCount =
+                (window.publishClickCount ?? 0) + 1;
+            });
+            document.querySelector("#body").addEventListener("click", () => {
+              window.editorClickCount =
+                (window.editorClickCount ?? 0) + 1;
+            });
+          </script>
+        </body>
+      </html>
+    """
+
+
+def _late_replacement_visibility_page_html() -> str:
+    return """
+      <!doctype html>
+      <html>
+        <body>
+          <header><a class="gn_name" href="/u/123">Account</a></header>
+          <main id="composer-shell">
+            <textarea id="body" placeholder="分享新鲜事"></textarea>
+            <section id="visibility-slot"></section>
+            <div id="visibility-options" role="listbox" hidden>
+              <button type="button" role="option">公开</button>
+              <button type="button" role="option">仅自己可见</button>
+            </div>
+            <button id="publish" type="button">发送</button>
+          </main>
+          <script>
+            let currentLabel = "公开";
+            let generation = 0;
+            const slot = document.querySelector("#visibility-slot");
+            const options = document.querySelector("#visibility-options");
+
+            const renderTrigger = (scheduleLateReplacement) => {
+              generation += 1;
+              const trigger = document.createElement("button");
+              trigger.type = "button";
+              trigger.id = "current-visibility";
+              trigger.className = "audience-selector";
+              trigger.dataset.audienceControl = String(generation);
+              trigger.textContent = currentLabel;
+              trigger.setAttribute("aria-label", currentLabel);
+              trigger.setAttribute("aria-haspopup", "listbox");
+              trigger.addEventListener("click", () => {
+                window.triggerClicked = true;
+                options.hidden = false;
+              });
+              if (scheduleLateReplacement) {
+                const nativeGetClientRects =
+                  trigger.getClientRects.bind(trigger);
+                let replacementQueued = false;
+                trigger.getClientRects = () => {
+                  if (!replacementQueued) {
+                    replacementQueued = true;
+                    queueMicrotask(() => {
+                      if (!slot.contains(trigger)) {
+                        return;
+                      }
+                      window.triggerReplacementCount =
+                        (window.triggerReplacementCount ?? 0) + 1;
+                      renderTrigger(false);
+                    });
+                  }
+                  return nativeGetClientRects();
+                };
+              }
+              slot.replaceChildren(trigger);
+            };
+
+            for (const option of options.querySelectorAll("button")) {
+              option.addEventListener("click", () => {
+                currentLabel = option.textContent;
+                options.hidden = true;
+                renderTrigger(false);
+              });
+            }
+
+            renderTrigger(true);
+          </script>
+          <script>
+            document.querySelector("#publish").addEventListener("click", () => {
+              window.publishClickCount =
+                (window.publishClickCount ?? 0) + 1;
+            });
+            document.querySelector("#body").addEventListener("click", () => {
+              window.editorClickCount =
+                (window.editorClickCount ?? 0) + 1;
+            });
+          </script>
+        </body>
+      </html>
+    """
+
+
+def _option_decoy_visibility_page_html() -> str:
+    return """
+      <!doctype html>
+      <html>
+        <body>
+          <header><a class="gn_name" href="/u/123">Account</a></header>
+          <main id="composer-shell">
+            <textarea id="body" placeholder="分享新鲜事"></textarea>
+            <button id="visibility" type="button" aria-label="仅自己可见">
+              仅自己可见
+            </button>
+            <section id="opened-controls"></section>
+            <div id="visibility-popup" role="listbox" hidden>
+              <div role="option">公开</div>
+            </div>
+            <button id="publish" type="button">发送</button>
+          </main>
+          <script>
+            const visibility = document.querySelector("#visibility");
+            const popup = document.querySelector("#visibility-popup");
+            const openedControls =
+              document.querySelector("#opened-controls");
+            visibility.addEventListener("click", () => {
+              if (!document.querySelector("#public-decoy")) {
+                const decoy = document.createElement("button");
+                decoy.id = "public-decoy";
+                decoy.type = "button";
+                decoy.textContent = "公开";
+                decoy.addEventListener("click", () => {
+                  window.decoyClickCount =
+                    (window.decoyClickCount ?? 0) + 1;
+                });
+                openedControls.appendChild(decoy);
+              }
+              popup.hidden = false;
+            });
+            popup.querySelector('[role="option"]').addEventListener(
+              "click",
+              () => {
+                window.optionClickCount =
+                  (window.optionClickCount ?? 0) + 1;
+                visibility.textContent = "公开";
+                visibility.setAttribute("aria-label", "公开");
+                popup.hidden = true;
+              }
+            );
             document.querySelector("#publish").addEventListener("click", () => {
               window.publishClickCount =
                 (window.publishClickCount ?? 0) + 1;
