@@ -199,10 +199,8 @@ class JobExecutor:
                 await publisher.close()
 
     def _validate_preparation(self, job: Job) -> None:
-        if job.visibility is not Visibility.PUBLIC:
-            raise ValueError(
-                "Only public visibility is supported for automatic publishing"
-            )
+        if job.visibility not in {Visibility.PUBLIC, Visibility.PRIVATE}:
+            raise ValueError("followers visibility is not supported yet")
 
         images = validate_images(job.images)
         fingerprint = build_fingerprint(

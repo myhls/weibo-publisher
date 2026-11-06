@@ -9,6 +9,7 @@ import pytest
 from playwright.async_api import Page, async_playwright
 
 from weibo_publisher import weibo
+from weibo_publisher.models import Visibility
 
 _PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
@@ -174,7 +175,57 @@ async def test_prepare_page_does_not_save_preview_after_image_timeout(
         monkeypatch.setattr(weibo, "_PREVIEW_IMAGE_TIMEOUT_SECONDS", 0.25)
 
         with pytest.raises(RuntimeError, match="uploaded image preview"):
-            await weibo._prepare_page(page, "preview text", [image], artifact_dir)
+            await weibo._prepare_page(
+                page,
+                "preview text",
+                [image],
+                Visibility.PUBLIC,
+                artifact_dir,
+            )
+
+    assert not (artifact_dir / "preview.png").exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_page_fails_before_preview_when_private_not_selectable(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+
+    async with _page_context() as page:
+        await page.context.route(
+            "https://weibo.com/",
+            _html_route(
+                """
+                <header><a class="gn_name" href="/u/123">Account</a></header>
+                <main>
+                  <textarea placeholder="分享新鲜事"></textarea>
+                  <button id="visibility" type="button">公开</button>
+                  <button id="publish" type="button">发布</button>
+                </main>
+                <script>
+                  document.querySelector("#publish").addEventListener(
+                    "click",
+                    () => {
+                      document.body.dataset.publishClicked = "true";
+                    }
+                  );
+                </script>
+                """
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="仅自己可见"):
+            await weibo._prepare_page(
+                page,
+                "preview text",
+                [],
+                Visibility.PRIVATE,
+                artifact_dir,
+            )
+
+        assert await page.evaluate("document.body.dataset.publishClicked ?? null") is None
 
     assert not (artifact_dir / "preview.png").exists()
 

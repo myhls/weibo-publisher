@@ -289,6 +289,27 @@ def test_confirmation_rejects_followers_visibility_atomically(tmp_path: Path) ->
     assert loaded.fingerprint == ""
 
 
+def test_confirmation_accepts_private_visibility_atomically(tmp_path: Path) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+    repo.initialize()
+    job = make_job()
+    job.visibility = Visibility.PRIVATE
+    repo.create_job(job)
+
+    confirmed = repo.confirm_job(
+        "job-1",
+        "confirmed-fingerprint",
+        datetime(2026, 11, 6, 9, 0, tzinfo=UTC),
+        daily_limit=100,
+        minimum_gap_seconds=240,
+        allow_over_limit=False,
+    )
+
+    assert confirmed.status is JobStatus.APPROVED
+    assert confirmed.visibility is Visibility.PRIVATE
+    assert confirmed.fingerprint == "confirmed-fingerprint"
+
+
 def test_confirmation_is_atomic_for_daily_limit(tmp_path: Path) -> None:
     repo = JobRepository(tmp_path / "state.db")
     repo.initialize()

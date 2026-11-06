@@ -60,6 +60,7 @@ def approved_job(
     image: Path | None = None,
     fingerprint: str | None = None,
     timezone: str = "Asia/Shanghai",
+    visibility: Visibility = Visibility.PUBLIC,
 ) -> Job:
     target = datetime.now(UTC) + timedelta(seconds=seconds_from_now)
     return approved_job_at(
@@ -67,6 +68,7 @@ def approved_job(
         image=image,
         fingerprint=fingerprint,
         timezone=timezone,
+        visibility=visibility,
     )
 
 
@@ -76,6 +78,7 @@ def approved_job_at(
     image: Path | None = None,
     fingerprint: str | None = None,
     timezone: str = "Asia/Shanghai",
+    visibility: Visibility = Visibility.PUBLIC,
 ) -> Job:
     images = [image] if image is not None else []
     job = Job(
@@ -84,7 +87,7 @@ def approved_job_at(
         images=images,
         publish_at_utc=target,
         timezone=timezone,
-        visibility=Visibility.PUBLIC,
+        visibility=visibility,
         status=JobStatus.APPROVED,
         fingerprint="",
         created_at=datetime.now(UTC),
@@ -144,6 +147,52 @@ async def test_success_records_attempt_and_publishes(
     assert sleep_delays and sleep_delays[0] > 0
     assert len(attempts) == 1
     assert attempts[0]["outcome"] == AttemptOutcome.SUCCESS.value
+
+
+@pytest.mark.asyncio
+async def test_private_job_is_prepared_and_published(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = approved_job(seconds_from_now=5, visibility=Visibility.PRIVATE)
+    repo = repository_with(app_config, job)
+    fake = FakePublisher()
+
+    async def skip_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr("weibo_publisher.scheduler.asyncio.sleep", skip_sleep)
+
+    await JobExecutor(app_config, repo, lambda: fake).execute(job.id)
+
+    stored = repo.get_job(job.id)
+    assert stored is not None
+    assert stored.visibility is Visibility.PRIVATE
+    assert stored.status is JobStatus.PUBLISHED
+    assert fake.prepare_calls == 1
+    assert fake.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_followers_job_needs_attention_without_publisher(
+    app_config: AppConfig,
+) -> None:
+    job = approved_job(seconds_from_now=60, visibility=Visibility.FOLLOWERS)
+    repo = repository_with(app_config, job)
+    factory_calls = 0
+
+    def factory() -> FakePublisher:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FakePublisher()
+
+    await JobExecutor(app_config, repo, factory).execute(job.id)
+
+    stored = repo.get_job(job.id)
+    assert stored is not None
+    assert stored.status is JobStatus.NEEDS_ATTENTION
+    assert stored.last_error == "followers visibility is not supported yet"
+    assert factory_calls == 0
 
 
 @pytest.mark.asyncio

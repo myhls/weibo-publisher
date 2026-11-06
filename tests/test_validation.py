@@ -28,6 +28,17 @@ def test_fingerprint_changes_when_image_changes(tmp_path: Path) -> None:
     assert first != second
 
 
+def test_fingerprint_includes_visibility(tmp_path: Path) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"image")
+    publish_at = datetime(2026, 11, 7, 9, 30, tzinfo=UTC)
+
+    public = build_fingerprint("可爱", [image], publish_at, Visibility.PUBLIC)
+    private = build_fingerprint("可爱", [image], publish_at, Visibility.PRIVATE)
+
+    assert public != private
+
+
 def test_parse_publish_time_requires_timezone() -> None:
     with pytest.raises(ValueError, match="timezone"):
         parse_publish_time("2026-11-07T17:30:00", "Asia/Shanghai")

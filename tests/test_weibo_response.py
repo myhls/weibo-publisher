@@ -41,6 +41,38 @@ def test_parse_success_response() -> None:
     assert result.weibo_url == "https://weibo.com/detail/123456"
 
 
+def test_parse_exact_live_private_ok_response() -> None:
+    result = parse_publish_response(
+        {
+            "ok": 1,
+            "msg": "发布成功",
+            "data": {
+                "idstr": "5362366986061756",
+                "mid": "5362366986061756",
+                "title": {"text": "仅自己可见"},
+            },
+        }
+    )
+
+    assert result.outcome is AttemptOutcome.SUCCESS
+    assert result.weibo_mid == "5362366986061756"
+    assert result.weibo_url == "https://weibo.com/detail/5362366986061756"
+    assert result.error is None
+
+
+@pytest.mark.parametrize("ok_value", [1, True, "1", "true"])
+def test_parse_ok_success_values_with_post_id(ok_value: object) -> None:
+    result = parse_publish_response(
+        {
+            "ok": ok_value,
+            "data": {"idstr": "123456"},
+        }
+    )
+
+    assert result.outcome is AttemptOutcome.SUCCESS
+    assert result.weibo_mid == "123456"
+
+
 def test_parse_error_response() -> None:
     result = parse_publish_response(
         {
@@ -51,6 +83,43 @@ def test_parse_error_response() -> None:
 
     assert result.outcome is AttemptOutcome.FAILED
     assert "发布失败" in result.error
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ok": 0, "msg": "发布失败"},
+        {"ok": False, "message": "request rejected"},
+        {"ok": 1, "code": 100001, "msg": "code rejected"},
+    ],
+)
+def test_parse_explicit_failure_returns_failed_message(
+    payload: dict[str, Any],
+) -> None:
+    result = parse_publish_response(payload)
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error in {"发布失败", "request rejected", "code rejected"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"msg": "no outcome"},
+        {"ok": None},
+        {"ok": 2, "data": {"idstr": "123"}},
+        {"ok": 1, "data": {}},
+        {"ok": 1, "data": {"mid": "   "}},
+    ],
+)
+def test_parse_missing_or_invalid_outcome_is_unknown(
+    payload: dict[str, Any],
+) -> None:
+    result = parse_publish_response(payload)
+
+    assert result.outcome is AttemptOutcome.UNKNOWN
+    assert result.error
 
 
 @pytest.mark.parametrize(
@@ -92,6 +161,36 @@ async def test_submit_success_uses_one_click_and_returns_detail_url(
         weibo_mid="987654",
         weibo_url="https://weibo.com/detail/987654",
     )
+    assert click_count == 1
+
+
+@pytest.mark.asyncio
+async def test_private_submit_uses_exact_live_payload_and_one_click(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nprivate")
+    job = _job(images=[image], visibility=Visibility.PRIVATE)
+
+    result, click_count = await _submit_with_response(
+        app_config,
+        monkeypatch,
+        {
+            "ok": 1,
+            "msg": "发布成功",
+            "data": {
+                "idstr": "5362366986061756",
+                "mid": "5362366986061756",
+                "title": {"text": "仅自己可见"},
+            },
+        },
+        job=job,
+    )
+
+    assert result.outcome is AttemptOutcome.SUCCESS
+    assert result.weibo_mid == "5362366986061756"
     assert click_count == 1
 
 
@@ -309,7 +408,7 @@ async def test_submit_unfinished_upload_fails_before_click(
 @pytest.mark.parametrize(
     ("visibility_label", "expected_error"),
     [
-        ("仅粉丝可见", "visibility is not public"),
+        ("仅自己可见", "visibility does not match public job"),
         (None, "visibility could not be verified"),
     ],
 )
@@ -357,7 +456,83 @@ async def test_submit_requires_verified_public_visibility(
 
 
 @pytest.mark.asyncio
-async def test_submit_revalidates_image_and_public_visibility_before_one_click(
+async def test_submit_rejects_public_label_for_private_job_before_click(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job(visibility=Visibility.PRIVATE)
+    artifact_dir = app_config.artifacts_dir / "job-private-mismatch"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"ok": 1, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.locator("#visibility").evaluate(
+            """
+            (element) => {
+              element.textContent = "公开";
+              element.setAttribute("aria-label", "公开");
+            }
+            """
+        )
+        result = await publisher.submit(job, artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error is not None
+    assert "visibility does not match private job" in result.error
+    assert click_count == 0
+    assert observed["post_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_prepare_selects_and_verifies_private_visibility_after_content(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nprivate")
+    job = _job(images=[image], visibility=Visibility.PRIVATE)
+    artifact_dir = app_config.artifacts_dir / "job-private-prepare"
+
+    publisher, _ = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"ok": 1, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        current_label = await publisher.page.locator("#visibility").inner_text()
+        prepared_before_opening = await publisher.page.evaluate(
+            "window.visibilityOpenedWithPreparedContent"
+        )
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert current_label == "仅自己可见"
+    assert prepared_before_opening is True
+    assert click_count == 0
+    assert (artifact_dir / "preview.png").is_file()
+
+
+@pytest.mark.asyncio
+async def test_submit_revalidates_image_and_visibility_before_one_click(
     app_config: AppConfig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -395,17 +570,20 @@ async def _submit_with_response(
     response_payload: dict[str, Any],
     *,
     artifact_dir: Path | None = None,
+    job: Job | None = None,
 ) -> tuple[PublishResult, int]:
     artifact_dir = artifact_dir or app_config.artifacts_dir / "job-submit"
+    job = job or _job()
     publisher, observed = await _prepared_publisher(
         app_config,
         monkeypatch,
         response_payload=response_payload,
         artifact_dir=artifact_dir,
+        job=job,
     )
 
     try:
-        result = await publisher.submit(_job(), artifact_dir)
+        result = await publisher.submit(job, artifact_dir)
         click_count = await publisher.page.evaluate(
             "window.publishClickCount ?? 0"
         )
@@ -486,10 +664,32 @@ def _page_html(*, sends_post: bool) -> str:
         <main>
           <textarea id="body" placeholder="分享新鲜事"></textarea>
           <input id="image" type="file" accept="image/*" multiple style="display:none">
-          <button id="visibility" type="button" aria-label="公开可见">公开可见</button>
+          <button id="visibility" type="button" aria-label="公开">公开</button>
+          <div id="visibility-options" hidden>
+            <button type="button">公开</button>
+            <button type="button">粉丝</button>
+            <button type="button">好友圈</button>
+            <button type="button">仅自己可见</button>
+            <button type="button">群可见</button>
+          </div>
           <button id="publish" type="button">发布</button>
         </main>
         <script>
+          const visibility = document.querySelector("#visibility");
+          const visibilityOptions = document.querySelector("#visibility-options");
+          visibility.addEventListener("click", () => {{
+            window.visibilityOpenedWithPreparedContent =
+              document.querySelector("#body").value.length > 0 &&
+              document.querySelector("#image").files.length > 0;
+            visibilityOptions.hidden = false;
+          }});
+          for (const option of visibilityOptions.querySelectorAll("button")) {{
+            option.addEventListener("click", () => {{
+              visibility.textContent = option.textContent;
+              visibility.setAttribute("aria-label", option.textContent);
+              visibilityOptions.hidden = true;
+            }});
+          }}
           document.querySelector("#image").addEventListener("change", (event) => {{
             for (const file of Array.from(event.target.files ?? [])) {{
               const image = document.createElement("img");
@@ -550,14 +750,18 @@ def _local_config(config: AppConfig) -> AppConfig:
     return replace(config, browser_channel="", headless=True)
 
 
-def _job(*, images: list[Path] | None = None) -> Job:
+def _job(
+    *,
+    images: list[Path] | None = None,
+    visibility: Visibility = Visibility.PUBLIC,
+) -> Job:
     return Job(
         id="job-submit",
         text="submit test",
         images=images or [],
         publish_at_utc=datetime.now(UTC) + timedelta(days=1),
         timezone="Asia/Shanghai",
-        visibility=Visibility.PUBLIC,
+        visibility=visibility,
         status=JobStatus.READY,
         fingerprint="fingerprint",
         created_at=datetime.now(UTC),

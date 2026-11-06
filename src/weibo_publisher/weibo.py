@@ -38,10 +38,15 @@ PUBLISH_SELECTORS = [
 ]
 VISIBILITY_SELECTORS = [
     '[data-testid="visibility"]',
+    '[id*="visibility"]',
     '[data-visibility]',
-    '[aria-label*="可见"]',
+    'button[aria-label*="可见"]',
+    '[role="button"][aria-label*="可见"]',
     'button:has-text("公开")',
     'button:has-text("粉丝")',
+    'button:has-text("好友圈")',
+    'button:has-text("仅自己可见")',
+    'button:has-text("群可见")',
     '[class*="visibility"]',
 ]
 
@@ -60,6 +65,15 @@ _PREVIEW_IMAGE_POLL_INTERVAL_SECONDS = 0.2
 _PUBLISH_RESPONSE_TIMEOUT_MS = 30_000
 _PUBLISH_ENDPOINT = "/ajax/statuses/update"
 _PUBLIC_VISIBILITY_LABELS = frozenset({"公开", "公开可见", "所有人可见"})
+_PRIVATE_VISIBILITY_LABEL = "仅自己可见"
+_OTHER_VISIBILITY_LABELS = frozenset({"粉丝", "好友圈", "群可见"})
+_KNOWN_VISIBILITY_LABELS = (
+    _PUBLIC_VISIBILITY_LABELS
+    | {_PRIVATE_VISIBILITY_LABEL}
+    | _OTHER_VISIBILITY_LABELS
+)
+_VISIBILITY_TIMEOUT_SECONDS = 3.0
+_VISIBILITY_POLL_INTERVAL_SECONDS = 0.1
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +113,13 @@ class WeiboPublisher:
             )
             self._context = context
             self.page = context.pages[0] if context.pages else await context.new_page()
-            await _prepare_page(self.page, job.text, images, artifact_dir)
+            await _prepare_page(
+                self.page,
+                job.text,
+                images,
+                job.visibility,
+                artifact_dir,
+            )
             attached_images = await _read_attached_image_identities(self.page)
             if len(attached_images) != len(images):
                 raise RuntimeError(
@@ -123,7 +143,7 @@ class WeiboPublisher:
         page = self.page
         try:
             images = validate_images(job.images)
-            if job.visibility is not Visibility.PUBLIC:
+            if job.visibility not in {Visibility.PUBLIC, Visibility.PRIVATE}:
                 raise RuntimeError("followers visibility is not supported yet")
             prepared_state = self._prepared_state
             if prepared_state is None:
@@ -141,6 +161,7 @@ class WeiboPublisher:
                 page,
                 job,
                 prepared_state.attached_images,
+                job.visibility,
             )
             button = await first_visible(page, PUBLISH_SELECTORS)
         except Exception as exc:  # noqa: BLE001 - pre-click failures are definite
@@ -200,13 +221,20 @@ async def preview_job(
 
     async with persistent_context(config) as context:
         page = context.pages[0] if context.pages else await context.new_page()
-        await _prepare_page(page, job.text, images, artifact_dir)
+        await _prepare_page(
+            page,
+            job.text,
+            images,
+            job.visibility,
+            artifact_dir,
+        )
 
 
 async def _prepare_page(
     page: Page,
     text: str,
     images: list[Path],
+    visibility: Visibility,
     artifact_dir: Path,
 ) -> None:
     await page.goto(
@@ -236,6 +264,8 @@ async def _prepare_page(
         await _wait_for_uploads(page)
         await _wait_for_uploaded_image_previews(page, len(images))
 
+    await _ensure_visibility(page, visibility)
+
     await page.screenshot(
         path=str(artifact_dir / "preview.png"),
         full_page=True,
@@ -260,26 +290,27 @@ def parse_publish_response(payload: dict) -> PublishResult:
         )
 
     code = payload.get("code")
-    if str(code).strip() == "100000":
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            return PublishResult(
-                outcome=AttemptOutcome.UNKNOWN,
-                error="Success code without post ID",
-            )
+    raw_code = str(code).strip() if code is not None else ""
+    ok = payload.get("ok")
 
-        raw_mid = data.get("idstr") or data.get("mid")
-        if isinstance(raw_mid, bool) or not isinstance(raw_mid, (str, int)):
-            return PublishResult(
-                outcome=AttemptOutcome.UNKNOWN,
-                error="Success code without post ID",
-            )
+    if _is_ok_failure(ok) or (raw_code and raw_code != "100000"):
+        return PublishResult(
+            outcome=AttemptOutcome.FAILED,
+            error=_response_message(payload),
+        )
 
-        mid = str(raw_mid).strip()
-        if not mid:
+    ok_success = _is_ok_success(ok)
+    legacy_success = raw_code == "100000"
+    if ok_success or legacy_success:
+        mid = _post_id_from_payload(payload)
+        if mid is None:
             return PublishResult(
                 outcome=AttemptOutcome.UNKNOWN,
-                error="Success code without post ID",
+                error=(
+                    "Success response without post ID"
+                    if ok_success
+                    else "Success code without post ID"
+                ),
             )
         return PublishResult(
             outcome=AttemptOutcome.SUCCESS,
@@ -287,16 +318,51 @@ def parse_publish_response(payload: dict) -> PublishResult:
             weibo_url=f"https://weibo.com/detail/{mid}",
         )
 
-    if code is None or not str(code).strip():
-        return PublishResult(
-            outcome=AttemptOutcome.UNKNOWN,
-            error="Publish response did not include a status code",
-        )
-
     return PublishResult(
-        outcome=AttemptOutcome.FAILED,
-        error=str(payload.get("msg") or payload.get("message") or payload),
+        outcome=AttemptOutcome.UNKNOWN,
+        error="Publish response did not include a recognized outcome",
     )
+
+
+def _is_ok_success(value: object) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true"}
+    return False
+
+
+def _is_ok_failure(value: object) -> bool:
+    if value is False:
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"0", "false"}
+    return False
+
+
+def _response_message(payload: dict) -> str:
+    message = payload.get("msg") or payload.get("message")
+    if message is None or not str(message).strip():
+        return "Weibo rejected the publish request"
+    return str(message)
+
+
+def _post_id_from_payload(payload: dict) -> str | None:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    for key in ("idstr", "mid"):
+        raw_mid = data.get(key)
+        if isinstance(raw_mid, bool) or not isinstance(raw_mid, (str, int)):
+            continue
+        mid = str(raw_mid).strip()
+        if mid:
+            return mid
+    return None
 
 
 async def _first_present(page: Page, selectors: list[str]) -> Locator:
@@ -444,6 +510,7 @@ async def _validate_submit_page(
     page: Page,
     job: Job,
     prepared_images: tuple[_AttachedImageIdentity, ...],
+    visibility: Visibility,
 ) -> None:
     composer = await first_visible(page, TEXT_SELECTORS)
     composer_text = await _read_composer_text(composer)
@@ -468,8 +535,12 @@ async def _validate_submit_page(
     visibility_label = await _read_visibility_label(page)
     if visibility_label is None:
         raise RuntimeError("visibility could not be verified before submit")
-    if visibility_label not in _PUBLIC_VISIBILITY_LABELS:
-        raise RuntimeError(f"visibility is not public: {visibility_label}")
+    expected_labels = _visibility_labels_for(visibility)
+    if visibility_label not in expected_labels:
+        raise RuntimeError(
+            f"visibility does not match {visibility.value} job: "
+            f"{visibility_label}"
+        )
 
 
 async def _read_composer_text(composer: Locator) -> str:
@@ -562,15 +633,122 @@ async def _read_visibility_label(page: Page) -> str | None:
             candidate = locator.nth(index)
             if not await candidate.is_visible():
                 continue
-            text = normalize_text(await candidate.inner_text())
-            if text:
-                return text
-            aria_label = normalize_text(
-                await candidate.get_attribute("aria-label") or ""
-            )
-            if aria_label:
-                return aria_label
+            label = await _visibility_label_for(candidate)
+            if label is not None:
+                return label
+
+    for label in _KNOWN_VISIBILITY_LABELS:
+        locator = page.get_by_text(label, exact=True)
+        for index in range(await locator.count()):
+            if await locator.nth(index).is_visible():
+                return label
     return None
+
+
+async def _ensure_visibility(page: Page, visibility: Visibility) -> None:
+    if visibility is Visibility.PUBLIC:
+        current = await _read_visibility_label(page)
+        if current not in _PUBLIC_VISIBILITY_LABELS:
+            current_label = current or "unavailable"
+            raise RuntimeError(
+                "public visibility could not be verified after preparation; "
+                f"current label is {current_label}"
+            )
+        return
+
+    if visibility is Visibility.PRIVATE:
+        current = await _read_visibility_label(page)
+        if current == _PRIVATE_VISIBILITY_LABEL:
+            return
+
+        trigger = await _find_visibility_trigger(page)
+        await trigger.click()
+        option = await _first_visible_exact_text(
+            page,
+            _PRIVATE_VISIBILITY_LABEL,
+        )
+        await option.click()
+        await _wait_for_locator_visibility(
+            trigger,
+            visibility,
+        )
+        return
+
+    raise RuntimeError("followers visibility is not supported yet")
+
+
+async def _find_visibility_trigger(page: Page) -> Locator:
+    for selector in VISIBILITY_SELECTORS:
+        locator = page.locator(selector)
+        for index in range(await locator.count()):
+            candidate = locator.nth(index)
+            if not await candidate.is_visible():
+                continue
+            if await _visibility_label_for(candidate) is not None:
+                return candidate
+
+    for label in _KNOWN_VISIBILITY_LABELS:
+        locator = page.get_by_text(label, exact=True)
+        for index in range(await locator.count()):
+            candidate = locator.nth(index)
+            if await candidate.is_visible():
+                return candidate
+    raise RuntimeError("Weibo visibility control could not be found")
+
+
+async def _first_visible_exact_text(page: Page, text: str) -> Locator:
+    locator = page.get_by_text(text, exact=True)
+    for index in range(await locator.count()):
+        candidate = locator.nth(index)
+        if await candidate.is_visible():
+            return candidate
+    raise RuntimeError(f"Weibo visibility option {text} could not be found")
+
+
+async def _visibility_label_for(candidate: Locator) -> str | None:
+    values = [
+        await candidate.inner_text(),
+        await candidate.get_attribute("aria-label") or "",
+        await candidate.get_attribute("data-visibility") or "",
+    ]
+    for value in values:
+        label = normalize_text(value)
+        if label in _KNOWN_VISIBILITY_LABELS:
+            return label
+    return None
+
+
+async def _wait_for_locator_visibility(
+    locator: Locator,
+    visibility: Visibility,
+) -> None:
+    expected_labels = _visibility_labels_for(visibility)
+    expected_label = (
+        _PRIVATE_VISIBILITY_LABEL
+        if visibility is Visibility.PRIVATE
+        else "公开"
+    )
+    deadline = time.monotonic() + _VISIBILITY_TIMEOUT_SECONDS
+    current: str | None = None
+    while True:
+        current = await _visibility_label_for(locator)
+        if current in expected_labels:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Weibo visibility {expected_label} could not be verified; "
+                f"current label is {current or 'unavailable'}"
+            )
+        await asyncio.sleep(min(_VISIBILITY_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _visibility_labels_for(visibility: Visibility) -> frozenset[str]:
+    if visibility is Visibility.PUBLIC:
+        return _PUBLIC_VISIBILITY_LABELS
+    if visibility is Visibility.PRIVATE:
+        return frozenset({_PRIVATE_VISIBILITY_LABEL})
+    raise RuntimeError("followers visibility is not supported yet")
 
 
 async def _screenshot_safely(page: Page, path: Path) -> None:

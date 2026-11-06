@@ -292,7 +292,7 @@ class JobRepository:
             job = self._row_to_job(row)
             if job.status is not JobStatus.DRAFT:
                 raise ConfirmationError(f"job is not a draft: {job.status}")
-            if job.visibility is not Visibility.PUBLIC:
+            if job.visibility not in {Visibility.PUBLIC, Visibility.PRIVATE}:
                 raise ConfirmationError(
                     "followers visibility is not supported yet"
                 )

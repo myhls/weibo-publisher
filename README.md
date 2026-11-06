@@ -62,6 +62,15 @@ python -m weibo_publisher add --text "可爱" --image "D:\path\image.jpg" --at "
 Repeat `--image` to attach more than one image. The publish time must be an ISO
 8601 timestamp with a timezone. `add` creates a draft and does not publish it.
 
+Use `--visibility public|private` to choose the audience. The default is
+`public`. `private` means Weibo `仅自己可见`:
+
+```powershell
+python -m weibo_publisher add --text "仅自己可见" --image "D:\path\image.jpg" --at "2026-11-07T17:30:00+08:00" --visibility private
+```
+
+Followers, friends-circle, and group visibility are not supported.
+
 ## Show and confirm
 
 ```powershell
@@ -129,8 +138,9 @@ which avoids accidental duplicate posts.
 - The login session may expire and require another QR-code login.
 - Weibo page structure and network behavior may change without notice.
 - A local limit does not guarantee acceptance by Weibo.
-- Live publishing against the current Weibo web client has not been validated
-  end to end.
+- Live publishing was smoke-tested with one private text-and-image post, but
+  broader content, account, and visibility combinations have not been
+  validated end to end.
 
 ## Safety
 

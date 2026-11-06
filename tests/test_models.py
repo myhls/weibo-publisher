@@ -34,3 +34,7 @@ def test_disallowed_transition_raises() -> None:
 def test_unknown_cannot_return_to_approved() -> None:
     with pytest.raises(ValueError):
         assert_transition_allowed(JobStatus.UNKNOWN, JobStatus.APPROVED)
+
+
+def test_private_visibility_has_stable_cli_value() -> None:
+    assert Visibility.PRIVATE == "private"

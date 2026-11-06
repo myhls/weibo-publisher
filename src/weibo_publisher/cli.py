@@ -54,8 +54,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     add.add_argument(
         "--visibility",
-        choices=[item.value for item in Visibility],
+        choices=[Visibility.PUBLIC.value, Visibility.PRIVATE.value],
         default=Visibility.PUBLIC.value,
+        help="Post visibility: public or private (仅自己可见).",
     )
     add.add_argument("--timezone", default=None, help="IANA timezone name.")
 
@@ -204,7 +205,7 @@ def _cmd_confirm(args: argparse.Namespace) -> int:
         return _fail(f"job not found: {args.job_id}")
     if job.status is not JobStatus.DRAFT:
         return _fail(f"job is not a draft: {job.status}")
-    if job.visibility is not Visibility.PUBLIC:
+    if job.visibility not in {Visibility.PUBLIC, Visibility.PRIVATE}:
         return _fail("followers visibility is not supported yet")
     if not normalize_text(job.text):
         return _fail("text must not be empty")

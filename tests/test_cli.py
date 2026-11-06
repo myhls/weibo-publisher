@@ -74,12 +74,79 @@ def test_add_creates_draft_and_confirm_approves(tmp_path: Path, monkeypatch) -> 
     draft = _only_draft(tmp_path)
     assert draft.fingerprint == ""
     assert draft.status is JobStatus.DRAFT
+    assert draft.visibility is Visibility.PUBLIC
 
     assert main(["confirm", draft.id]) == 0
     approved = JobRepository(load_config(root=tmp_path).db_path).get_job(draft.id)
     assert approved is not None
     assert approved.status is JobStatus.APPROVED
     assert approved.fingerprint
+
+
+def test_add_private_visibility_and_confirm_approves(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"jpeg")
+    monkeypatch.chdir(tmp_path)
+    future = datetime.now(UTC) + timedelta(days=1)
+
+    assert main(
+        [
+            "add",
+            "--text",
+            "仅自己可见",
+            "--image",
+            str(image),
+            "--at",
+            future.isoformat(),
+            "--visibility",
+            "private",
+        ]
+    ) == 0
+
+    draft = _only_draft(tmp_path)
+    assert draft.visibility is Visibility.PRIVATE
+    assert main(["confirm", draft.id]) == 0
+
+    approved = JobRepository(load_config(root=tmp_path).db_path).get_job(draft.id)
+    assert approved is not None
+    assert approved.status is JobStatus.APPROVED
+    assert approved.visibility is Visibility.PRIVATE
+    assert approved.fingerprint
+
+
+def test_add_rejects_followers_visibility_clearly(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"jpeg")
+    monkeypatch.chdir(tmp_path)
+    future = datetime.now(UTC) + timedelta(days=1)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "add",
+                "--text",
+                "仅粉丝可见",
+                "--image",
+                str(image),
+                "--at",
+                future.isoformat(),
+                "--visibility",
+                "followers",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    error = capsys.readouterr().err
+    assert "invalid choice: 'followers'" in error
+    assert "public" in error
+    assert "private" in error
 
 
 def test_confirm_rejects_followers_visibility(
@@ -91,21 +158,22 @@ def test_confirm_rejects_followers_visibility(
     image.write_bytes(b"jpeg")
     monkeypatch.chdir(tmp_path)
     future = datetime.now(UTC) + timedelta(days=1)
-
-    assert main(
-        [
-            "add",
-            "--text",
-            "仅粉丝可见",
-            "--image",
-            str(image),
-            "--at",
-            future.isoformat(),
-            "--visibility",
-            "followers",
-        ]
-    ) == 0
-    draft = _only_draft(tmp_path)
+    config = load_config(root=tmp_path)
+    ensure_runtime_dirs(config)
+    repo = JobRepository(config.db_path)
+    repo.initialize()
+    draft = Job(
+        id="followers-draft",
+        text="仅粉丝可见",
+        images=[image],
+        publish_at_utc=future,
+        timezone="Asia/Shanghai",
+        visibility=Visibility.FOLLOWERS,
+        status=JobStatus.DRAFT,
+        fingerprint="",
+        created_at=datetime.now(UTC),
+    )
+    repo.create_job(draft)
 
     code = main(["confirm", draft.id])
 

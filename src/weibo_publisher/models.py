@@ -22,6 +22,7 @@ class JobStatus(StrEnum):
 
 class Visibility(StrEnum):
     PUBLIC = "public"
+    PRIVATE = "private"
     FOLLOWERS = "followers"
 
 

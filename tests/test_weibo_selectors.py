@@ -360,7 +360,10 @@ def _html(body: str, script: str = "") -> str:
     return (
         "<!doctype html><html><head>"
         f"{script}{_IMAGE_PREVIEW_SCRIPT}"
-        f"</head><body>{body}</body></html>"
+        "</head><body>"
+        f"{body}"
+        '<button id="visibility" type="button" aria-label="公开">公开</button>'
+        "</body></html>"
     )
 
 
