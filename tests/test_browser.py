@@ -30,8 +30,18 @@ _AUTHENTICATED_HOME = _html(
     "</header>"
 )
 _PUBLIC_HOME = _html('<header><a href="/u/123">Public profile</a></header>')
+_COMPOSER_HOME = _html(
+    "<main>"
+    '<textarea placeholder="有什么新鲜事想分享给大家？"></textarea>'
+    "<button>发送</button>"
+    "</main>"
+)
 _CHALLENGE_HOME = _html(
     '<header><a class="gn_name" href="/u/123">Account</a></header>'
+    '<div role="dialog"><h2>安全验证</h2><p>Complete verification.</p></div>'
+)
+_COMPOSER_CHALLENGE_HOME = _html(
+    '<main><textarea placeholder="有什么新鲜事想分享给大家？"></textarea></main>'
     '<div role="dialog"><h2>安全验证</h2><p>Complete verification.</p></div>'
 )
 _DELAYED_HOME = _html(
@@ -121,6 +131,24 @@ async def test_logged_in_requires_weibo_origin_and_authenticated_signal() -> Non
 
         await page.goto("https://example.com/")
         assert await browser._logged_in(page) is False
+
+
+@pytest.mark.asyncio
+async def test_session_detects_composer_but_does_not_treat_profile_links_as_auth() -> None:
+    routes = {
+        "https://weibo.com/": _COMPOSER_HOME,
+        "https://weibo.com/public": _PUBLIC_HOME,
+        "https://weibo.com/challenge": _COMPOSER_CHALLENGE_HOME,
+    }
+    async with _routed_page(routes) as page:
+        await page.goto("https://weibo.com/")
+        assert await browser._session_state(page) == "logged_in"
+
+        await page.goto("https://weibo.com/public")
+        assert await browser._session_state(page) == "pending"
+
+        await page.goto("https://weibo.com/challenge")
+        assert await browser._session_state(page) == "blocked"
 
 
 @pytest.mark.asyncio

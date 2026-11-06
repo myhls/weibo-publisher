@@ -63,6 +63,8 @@ _VERIFICATION_TITLES = (
 )
 _AUTHENTICATED_SELECTORS = (
     '[class*="gn_name"]',
+    'textarea[placeholder*="有什么新鲜事"]',
+    'textarea[placeholder*="分享给大家"]',
 )
 
 logger = logging.getLogger(__name__)
