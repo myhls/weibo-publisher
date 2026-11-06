@@ -265,7 +265,7 @@ If the target time is already in the past when scheduling:
 
 Configuration includes:
 
-- `daily_limit`, default 20
+- `daily_limit`, default 100
 - `minimum_gap_seconds`, default 60
 - `allow_over_limit`, default false
 
@@ -275,6 +275,12 @@ not proceed when a hard limit is enabled and exceeded.
 These controls reduce accidental bursts but do not make high-volume publishing
 safe. The README must state that Weibo may restrict an account regardless of
 local limits.
+
+The project owner requires support for up to 100 posts per day on one account.
+The default `daily_limit` is therefore 100, while the `minimum_gap_seconds`
+guard remains enabled. This is a technical capacity target, not a guarantee
+that Weibo will accept all 100 posts. The runner must stop and require human
+attention when a rate-limit, verification, or authentication challenge appears.
 
 ## 12. Browser and Login Session
 
