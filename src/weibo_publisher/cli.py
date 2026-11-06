@@ -4,7 +4,7 @@ import argparse
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from weibo_publisher.config import ensure_runtime_dirs, load_config
 from weibo_publisher.models import Job, JobStatus, Visibility
@@ -89,11 +89,14 @@ def _local_time(job: Job) -> str:
 def _cmd_add(args: argparse.Namespace) -> int:
     repo, config = _repository_from_args(args)
     try:
+        ZoneInfo(args.timezone or config.default_timezone)
         publish_at_utc = parse_publish_time(
             args.at,
             args.timezone or config.default_timezone,
         )
         images = [Path(value) for value in args.image]
+    except ZoneInfoNotFoundError:
+        return _fail(f"Unknown timezone: {args.timezone}")
     except ValueError as exc:
         return _fail(str(exc))
 

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from weibo_publisher.cli import main
 from weibo_publisher.config import ensure_runtime_dirs, load_config
@@ -48,6 +49,15 @@ def _only_draft(root: Path) -> Job:
     config = load_config(root=root)
     repo = JobRepository(config.db_path)
     return repo.list_jobs(JobStatus.DRAFT)[-1]
+
+
+def _next_shanghai_noon() -> datetime:
+    zone = ZoneInfo("Asia/Shanghai")
+    now_local = datetime.now(UTC).astimezone(zone)
+    noon = now_local.replace(hour=12, minute=0, second=0, microsecond=0)
+    if noon <= now_local:
+        noon += timedelta(days=1)
+    return noon.astimezone(UTC)
 
 
 def test_add_creates_draft_and_confirm_approves(tmp_path: Path, monkeypatch) -> None:
@@ -118,6 +128,7 @@ def test_confirm_enforces_daily_limit(tmp_path: Path, monkeypatch, capsys) -> No
     image = tmp_path / "image.jpg"
     image.write_bytes(b"jpeg")
     monkeypatch.chdir(tmp_path)
+    noon = _next_shanghai_noon()
     config = load_config(root=tmp_path)
     ensure_runtime_dirs(config)
     repo = JobRepository(config.db_path)
@@ -127,7 +138,7 @@ def test_confirm_enforces_daily_limit(tmp_path: Path, monkeypatch, capsys) -> No
         id="existing",
         text="已有",
         images=[],
-        publish_at_utc=datetime.now(UTC) + timedelta(days=1),
+        publish_at_utc=noon,
         timezone="Asia/Shanghai",
         visibility=Visibility.PUBLIC,
         status=JobStatus.APPROVED,
@@ -136,13 +147,37 @@ def test_confirm_enforces_daily_limit(tmp_path: Path, monkeypatch, capsys) -> No
     )
     repo.create_job(existing)
 
-    future = datetime.now(UTC) + timedelta(days=1, hours=2)
+    future = noon + timedelta(hours=2)
     assert _add_draft(tmp_path, image, future) == 0
     draft = _only_draft(tmp_path)
     code = main(["confirm", draft.id])
 
     assert code == 2
     assert "daily limit" in capsys.readouterr().out
+
+
+def test_add_rejects_unknown_timezone(tmp_path: Path, monkeypatch, capsys) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"jpeg")
+    monkeypatch.chdir(tmp_path)
+    future = datetime.now(UTC) + timedelta(days=1)
+
+    code = main(
+        [
+            "add",
+            "--text",
+            "可爱",
+            "--image",
+            str(image),
+            "--at",
+            future.isoformat(),
+            "--timezone",
+            "Mars/Olympus",
+        ]
+    )
+
+    assert code == 2
+    assert "Unknown timezone" in capsys.readouterr().out
 
 
 def test_confirm_enforces_minimum_gap(tmp_path: Path, monkeypatch, capsys) -> None:
