@@ -91,6 +91,7 @@ Responsibility boundaries:
 - Produces:
   - `AppConfig` frozen dataclass with `root`, `runtime_dir`, `db_path`, `profile_dir`, `artifacts_dir`, `logs_dir`, `browser_channel`, `headless`, `default_timezone`, `prepare_lead_seconds`, `late_cutoff_seconds`, `daily_limit`, `minimum_gap_seconds`, `allow_over_limit`, and `artifact_retention_days`.
   - `load_config(path: Path | None = None) -> AppConfig`
+  - `ensure_runtime_dirs(config: AppConfig) -> None`
 
 - [ ] **Step 1: Write the failing configuration tests**
 
@@ -138,6 +139,17 @@ def test_load_config_rejects_non_positive_limits(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="daily_limit"):
         load_config(config_file, root=tmp_path)
+
+
+def test_runtime_directories_are_created(tmp_path: Path) -> None:
+    from weibo_publisher.config import ensure_runtime_dirs
+
+    config = load_config(root=tmp_path)
+    ensure_runtime_dirs(config)
+
+    assert config.runtime_dir.is_dir()
+    assert config.artifacts_dir.is_dir()
+    assert config.logs_dir.is_dir()
 ```
 
 Create `tests/conftest.py`:
@@ -352,6 +364,13 @@ def load_config(path: Path | None = None, root: Path | None = None) -> AppConfig
         allow_over_limit=bool(publishing.get("allow_over_limit", False)),
         artifact_retention_days=int(storage.get("artifact_retention_days", 30)),
     )
+
+
+def ensure_runtime_dirs(config: AppConfig) -> None:
+    config.runtime_dir.mkdir(parents=True, exist_ok=True)
+    config.profile_dir.mkdir(parents=True, exist_ok=True)
+    config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    config.logs_dir.mkdir(parents=True, exist_ok=True)
 ```
 
 - [ ] **Step 4: Run the tests and verify they pass**
@@ -1132,35 +1151,7 @@ git commit -m "feat: add task CLI and confirmation flow"
   - `persistent_context(config: AppConfig)` async context manager
   - `configure_logging(config: AppConfig) -> None`
 
-- [ ] **Step 1: Add a session-independent browser test**
-
-Add to `tests/test_config.py`:
-
-```python
-def test_runtime_directories_are_created(tmp_path: Path) -> None:
-    from weibo_publisher.config import ensure_runtime_dirs
-
-    config = load_config(root=tmp_path)
-    ensure_runtime_dirs(config)
-
-    assert config.runtime_dir.is_dir()
-    assert config.artifacts_dir.is_dir()
-    assert config.logs_dir.is_dir()
-```
-
-Expected first failure: `ensure_runtime_dirs` is missing.
-
-- [ ] **Step 2: Implement runtime directories and logging**
-
-Modify `config.py`:
-
-```python
-def ensure_runtime_dirs(config: AppConfig) -> None:
-    config.runtime_dir.mkdir(parents=True, exist_ok=True)
-    config.profile_dir.mkdir(parents=True, exist_ok=True)
-    config.artifacts_dir.mkdir(parents=True, exist_ok=True)
-    config.logs_dir.mkdir(parents=True, exist_ok=True)
-```
+- [ ] **Step 1: Write the logging setup used by the CLI**
 
 Create `logging_setup.py`:
 
@@ -1192,7 +1183,7 @@ def configure_logging(config) -> None:
     root.addHandler(file_handler)
 ```
 
-- [ ] **Step 3: Implement Playwright browser session**
+- [ ] **Step 2: Implement Playwright browser session**
 
 Create `browser.py`:
 
@@ -1261,7 +1252,7 @@ async def _logged_in(page) -> bool:
 
 Wire `login` and `doctor` in `cli.py` using `asyncio.run(...)`.
 
-- [ ] **Step 4: Run tests and manual login smoke test**
+- [ ] **Step 3: Run tests and manual login smoke test**
 
 Run:
 
@@ -1274,7 +1265,7 @@ python -m weibo_publisher doctor
 Expected: Chromium installs, tests pass, and `doctor` reports the session as
 missing until the user completes `python -m weibo_publisher login`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```powershell
 git add src/weibo_publisher/browser.py src/weibo_publisher/logging_setup.py src/weibo_publisher/config.py src/weibo_publisher/cli.py tests/test_config.py
