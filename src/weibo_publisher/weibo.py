@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,13 +60,28 @@ _PUBLISH_ENDPOINT = "/ajax/statuses/update"
 _PUBLIC_VISIBILITY_LABELS = frozenset({"公开", "公开可见", "所有人可见"})
 
 
+@dataclass(frozen=True, slots=True)
+class _AttachedImageIdentity:
+    name: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedComposerState:
+    text: str
+    image_paths: tuple[str, ...]
+    visibility: Visibility
+    attached_images: tuple[_AttachedImageIdentity, ...]
+
+
 class WeiboPublisher:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.page: Page | None = None
         self._context: BrowserContext | None = None
         self._exit_stack: AsyncExitStack | None = None
-        self._prepared_state: tuple[str, tuple[str, ...], Visibility] | None = None
+        self._prepared_state: _PreparedComposerState | None = None
 
     async def prepare(self, job: Job, artifact_dir: Path) -> None:
         if self._exit_stack is not None:
@@ -82,10 +98,17 @@ class WeiboPublisher:
             self._context = context
             self.page = context.pages[0] if context.pages else await context.new_page()
             await _prepare_page(self.page, job.text, images, artifact_dir)
-            self._prepared_state = (
-                normalize_text(job.text),
-                tuple(str(image) for image in images),
-                job.visibility,
+            attached_images = await _read_attached_image_identities(self.page)
+            if len(attached_images) != len(images):
+                raise RuntimeError(
+                    f"expected {len(images)} attached image(s), "
+                    f"found {len(attached_images)} after preparation"
+                )
+            self._prepared_state = _PreparedComposerState(
+                text=normalize_text(job.text),
+                image_paths=tuple(str(image) for image in images),
+                visibility=job.visibility,
+                attached_images=attached_images,
             )
         except BaseException:
             await self.close()
@@ -100,16 +123,23 @@ class WeiboPublisher:
             images = validate_images(job.images)
             if job.visibility is not Visibility.PUBLIC:
                 raise RuntimeError("followers visibility is not supported yet")
-            expected_state = (
-                normalize_text(job.text),
-                tuple(str(image) for image in images),
-                job.visibility,
-            )
-            if self._prepared_state != expected_state:
+            prepared_state = self._prepared_state
+            if prepared_state is None:
+                raise RuntimeError("Weibo publisher has not been prepared")
+            if (
+                prepared_state.text != normalize_text(job.text)
+                or prepared_state.image_paths
+                != tuple(str(image) for image in images)
+                or prepared_state.visibility is not job.visibility
+            ):
                 raise RuntimeError(
                     "submit job does not match the prepared composer state"
                 )
-            await _validate_submit_page(page, job)
+            await _validate_submit_page(
+                page,
+                job,
+                prepared_state.attached_images,
+            )
             button = await first_visible(page, PUBLISH_SELECTORS)
         except Exception as exc:  # noqa: BLE001 - pre-click failures are definite
             await _screenshot_safely(
@@ -283,18 +313,26 @@ async def _wait_for_uploads(page: Page) -> None:
         await asyncio.sleep(min(_UPLOAD_POLL_INTERVAL_SECONDS, remaining))
 
 
-async def _validate_submit_page(page: Page, job: Job) -> None:
+async def _validate_submit_page(
+    page: Page,
+    job: Job,
+    prepared_images: tuple[_AttachedImageIdentity, ...],
+) -> None:
     composer = await first_visible(page, TEXT_SELECTORS)
     composer_text = await _read_composer_text(composer)
     if normalize_text(composer_text) != normalize_text(job.text):
         raise RuntimeError("composer text does not match the prepared job")
 
+    attached_images = await _read_attached_image_identities(page)
     expected_images = len(job.images)
-    attached_images = await _attached_file_count(page)
-    if attached_images != expected_images:
+    if len(attached_images) != expected_images:
         raise RuntimeError(
             f"expected {expected_images} attached image(s), "
-            f"found {attached_images}"
+            f"found {len(attached_images)}"
+        )
+    if attached_images != prepared_images:
+        raise RuntimeError(
+            "attached image content or metadata does not match the prepared job"
         )
 
     if await _has_visible_indicator(page):
@@ -316,16 +354,78 @@ async def _read_composer_text(composer: Locator) -> str:
     return await composer.text_content() or ""
 
 
-async def _attached_file_count(page: Page) -> int:
+async def _read_attached_image_identities(
+    page: Page,
+) -> tuple[_AttachedImageIdentity, ...]:
     for selector in IMAGE_INPUT_SELECTORS:
         locator = page.locator(selector)
         if await locator.count():
-            return int(
-                await locator.first.evaluate(
-                    "(input) => input.files ? input.files.length : 0"
+            try:
+                raw_identities = await locator.first.evaluate(
+                    """
+                    async (input) => {
+                      if (!globalThis.crypto?.subtle) {
+                        throw new Error("crypto.subtle is unavailable");
+                      }
+                      const identities = [];
+                      for (const file of Array.from(input.files ?? [])) {
+                        const digest = await globalThis.crypto.subtle.digest(
+                          "SHA-256",
+                          await file.arrayBuffer(),
+                        );
+                        const sha256 = Array.from(
+                          new Uint8Array(digest),
+                          (byte) => byte.toString(16).padStart(2, "0"),
+                        ).join("");
+                        identities.push({
+                          name: file.name,
+                          size: file.size,
+                          sha256,
+                        });
+                      }
+                      return identities;
+                    }
+                    """
                 )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"attached image identity could not be computed: {exc}"
+                ) from exc
+            return _parse_attached_image_identities(raw_identities)
+    return ()
+
+
+def _parse_attached_image_identities(
+    raw_identities: object,
+) -> tuple[_AttachedImageIdentity, ...]:
+    if not isinstance(raw_identities, list):
+        raise TypeError("attached image identity response was not a list")
+
+    identities: list[_AttachedImageIdentity] = []
+    for raw_identity in raw_identities:
+        if not isinstance(raw_identity, dict):
+            raise TypeError("attached image identity was not an object")
+        name = raw_identity.get("name")
+        size = raw_identity.get("size")
+        sha256 = raw_identity.get("sha256")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("attached image identity is missing a name")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise RuntimeError("attached image identity has an invalid size")
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise RuntimeError("attached image identity has an invalid SHA-256")
+        identities.append(
+            _AttachedImageIdentity(
+                name=name,
+                size=size,
+                sha256=sha256,
             )
-    return 0
+        )
+    return tuple(identities)
 
 
 async def _read_visibility_label(page: Page) -> str | None:

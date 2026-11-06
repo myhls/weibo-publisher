@@ -218,6 +218,47 @@ async def test_submit_missing_image_attachment_fails_before_click(
 
 
 @pytest.mark.asyncio
+async def test_submit_same_count_image_replacement_fails_before_click(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_dir = tmp_path / "original"
+    replacement_dir = tmp_path / "replacement"
+    original_dir.mkdir()
+    replacement_dir.mkdir()
+    original = original_dir / "image.png"
+    replacement = replacement_dir / "image.png"
+    original.write_bytes(b"\x89PNG\r\n\x1a\noriginal")
+    replacement.write_bytes(b"\x89PNG\r\n\x1a\nreplaced")
+    assert original.stat().st_size == replacement.stat().st_size
+    job = _job(images=[original])
+    artifact_dir = app_config.artifacts_dir / "job-replaced-image"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"code": 100000, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.set_input_files("#image", str(replacement))
+        result = await publisher.submit(job, artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.error is not None and "attached image" in result.error
+    assert click_count == 0
+    assert observed["post_requests"] == 0
+
+
+@pytest.mark.asyncio
 async def test_submit_unfinished_upload_fails_before_click(
     app_config: AppConfig,
     tmp_path: Path,
