@@ -266,7 +266,7 @@ If the target time is already in the past when scheduling:
 Configuration includes:
 
 - `daily_limit`, default 100
-- `minimum_gap_seconds`, default 60
+- `minimum_gap_seconds`, default 240
 - `allow_over_limit`, default false
 
 `add` and `confirm` warn when a task would exceed a soft limit. Publishing does
@@ -281,6 +281,10 @@ The default `daily_limit` is therefore 100, while the `minimum_gap_seconds`
 guard remains enabled. This is a technical capacity target, not a guarantee
 that Weibo will accept all 100 posts. The runner must stop and require human
 attention when a rate-limit, verification, or authentication challenge appears.
+
+The 240-second minimum gap is required because one publish session holds the
+browser open for the three-minute preparation window. This avoids overlapping
+browser sessions while still allowing more than 100 posts within 24 hours.
 
 ## 12. Browser and Login Session
 
