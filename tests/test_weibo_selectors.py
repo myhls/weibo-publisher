@@ -72,13 +72,63 @@ async def test_weibo_publisher_prepare_fills_textarea_attaches_all_images_and_ne
     job = _job(images=[first_image, second_image])
 
     publisher = weibo.WeiboPublisher(_local_config(app_config))
-    await publisher.prepare(job, artifact_dir)
+    try:
+        await publisher.prepare(job, artifact_dir)
+        assert publisher.page is not None
+        assert not publisher.page.is_closed()
+        await _observe_page(publisher.page, observed)
+    finally:
+        await publisher.close()
 
     assert observed["textarea"] == job.text
     assert observed["contenteditable"] is None
     assert observed["files"] == ["first.png", "second.png"]
+    assert observed["publish_tripwire_armed"] is True
+    assert observed["page_errors"] == []
     assert observed["publish_clicked"] is None
+    assert observed["context_closed"] is True
     assert (artifact_dir / "preview.png").read_bytes().startswith(b"\x89PNG")
+
+
+@pytest.mark.asyncio
+async def test_weibo_publisher_close_releases_retained_context(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    page_html = _html(
+        """
+        <header><a class="gn_name" href="/u/123">Account</a></header>
+        <main>
+          <textarea id="body" placeholder="分享新鲜事"></textarea>
+          <button id="publish" type="button">发布</button>
+        </main>
+        """,
+        _PUBLISH_TRIPWIRE,
+    )
+    monkeypatch.setattr(
+        weibo,
+        "persistent_context",
+        _observing_routed_context_factory(
+            {"https://weibo.com/": page_html},
+            observed,
+        ),
+    )
+    publisher = weibo.WeiboPublisher(_local_config(app_config))
+
+    await publisher.prepare(_job(), app_config.artifacts_dir / "job-close")
+
+    assert publisher.page is not None
+    assert not publisher.page.is_closed()
+    assert observed["context_closed"] is False
+
+    await publisher.close()
+
+    assert publisher.page is None
+    assert observed["context_closed"] is True
+
+    await publisher.close()
+    assert observed["close_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -114,8 +164,57 @@ async def test_preview_job_inserts_text_into_first_visible_contenteditable(
     assert observed["textarea"] is None
     assert observed["contenteditable"] == job.text
     assert observed["files"] == []
+    assert observed["publish_tripwire_armed"] is True
+    assert observed["page_errors"] == []
     assert observed["publish_clicked"] is None
     assert (artifact_dir / "preview.png").is_file()
+
+
+@pytest.mark.asyncio
+async def test_preview_job_uses_normalized_image_paths(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    image = tmp_path / "normalized.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nnormalized")
+    page_html = _html(
+        """
+        <header><a class="gn_name" href="/u/123">Account</a></header>
+        <main>
+          <textarea id="body" placeholder="分享新鲜事"></textarea>
+          <input id="image-input" type="file" accept="image/*" multiple>
+          <button id="publish" type="button">发布</button>
+        </main>
+        """,
+        _PUBLISH_TRIPWIRE,
+    )
+    monkeypatch.setattr(
+        weibo,
+        "persistent_context",
+        _observing_routed_context_factory(
+            {"https://weibo.com/": page_html},
+            observed,
+        ),
+    )
+    monkeypatch.setattr(
+        weibo,
+        "validate_images",
+        lambda paths: [image.resolve()],
+    )
+    job = _job(images=[Path("not-the-normalized-path.png")])
+
+    await weibo.preview_job(
+        _local_config(app_config),
+        job,
+        app_config.artifacts_dir / "job-normalized",
+    )
+
+    assert observed["files"] == ["normalized.png"]
+    assert observed["publish_tripwire_armed"] is True
+    assert observed["page_errors"] == []
+    assert observed["publish_clicked"] is None
 
 
 @pytest.mark.asyncio
@@ -151,6 +250,8 @@ async def test_preview_job_rejects_invalid_session_before_entering_text(
         )
 
     assert observed["textarea"] == ""
+    assert observed["publish_tripwire_armed"] is True
+    assert observed["page_errors"] == []
     assert observed["publish_clicked"] is None
 
 
@@ -217,8 +318,15 @@ def test_preview_cli_passes_job_and_artifact_directory_to_adapter(
 
 _PUBLISH_TRIPWIRE = """
 <script>
-  document.querySelector("#publish").addEventListener("click", () => {
-    document.body.dataset.publishClicked = "true";
+  window.addEventListener("DOMContentLoaded", () => {
+    const publish = document.querySelector("#publish");
+    if (!publish) {
+      throw new Error("Publish tripwire target is missing");
+    }
+    publish.addEventListener("click", () => {
+      document.body.dataset.publishClicked = "true";
+    });
+    publish.dataset.tripwireArmed = "true";
   });
 </script>
 """
@@ -236,6 +344,9 @@ def _observing_routed_context_factory(
     routes: dict[str, str],
     observed: dict[str, object],
 ):
+    observed["context_closed"] = False
+    observed["close_count"] = 0
+
     @asynccontextmanager
     async def routed_context(config: AppConfig) -> AsyncIterator[BrowserContext]:
         del config
@@ -245,35 +356,50 @@ def _observing_routed_context_factory(
             for url, body in routes.items():
                 await context.route(url, _html_route(body))
             page = await context.new_page()
+            page_errors: list[str] = []
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            observed["page_errors"] = page_errors
+            observed["context"] = context
             try:
                 yield context
             finally:
-                textarea = page.locator("#body")
-                if await textarea.count() and await textarea.first.get_attribute(
-                    "contenteditable"
-                ) is None:
-                    observed["textarea"] = await textarea.first.input_value()
-                    observed["contenteditable"] = None
-                elif await textarea.count():
-                    observed["textarea"] = None
-                    observed["contenteditable"] = await textarea.first.text_content()
-                else:
-                    observed["textarea"] = None
-                    observed["contenteditable"] = None
-
-                image_input = page.locator("#image-input")
-                if await image_input.count():
-                    observed["files"] = await image_input.first.evaluate(
-                        "(input) => Array.from(input.files).map((file) => file.name)"
-                    )
-                else:
-                    observed["files"] = []
-                observed["publish_clicked"] = await page.evaluate(
-                    "document.body.dataset.publishClicked ?? null"
-                )
+                observed["context_closed"] = True
+                observed["close_count"] = int(observed["close_count"]) + 1
+                await _observe_page(page, observed)
                 await chrome.close()
 
     return routed_context
+
+
+async def _observe_page(page, observed: dict[str, object]) -> None:
+    textarea = page.locator("#body")
+    if await textarea.count() and await textarea.first.get_attribute(
+        "contenteditable"
+    ) is None:
+        observed["textarea"] = await textarea.first.input_value()
+        observed["contenteditable"] = None
+    elif await textarea.count():
+        observed["textarea"] = None
+        observed["contenteditable"] = await textarea.first.text_content()
+    else:
+        observed["textarea"] = None
+        observed["contenteditable"] = None
+
+    image_input = page.locator("#image-input")
+    if await image_input.count():
+        observed["files"] = await image_input.first.evaluate(
+            "(input) => Array.from(input.files).map((file) => file.name)"
+        )
+    else:
+        observed["files"] = []
+    publish = page.locator("#publish")
+    observed["publish_tripwire_armed"] = (
+        bool(await publish.count())
+        and await publish.first.get_attribute("data-tripwire-armed") == "true"
+    )
+    observed["publish_clicked"] = await page.evaluate(
+        "document.body.dataset.publishClicked ?? null"
+    )
 
 
 def _html_route(body: str):
