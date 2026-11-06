@@ -260,6 +260,19 @@ class JobRepository:
                 ),
             )
 
+    def list_attempts(self, job_id: str) -> list[dict[str, str | None]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT attempt_id, started_at, finished_at, outcome, error
+                FROM attempts
+                WHERE job_id = ?
+                ORDER BY started_at
+                """,
+                (job_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def _to_iso(self, value: datetime | None) -> str | None:
         if value is None:
             return None
