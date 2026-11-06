@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from weibo_publisher.browser import login, run_doctor
 from weibo_publisher.config import ensure_runtime_dirs, load_config
+from weibo_publisher.logging_setup import configure_logging
 from weibo_publisher.models import Job, JobStatus, Visibility
 from weibo_publisher.repository import JobRepository
 from weibo_publisher.validation import (
@@ -29,6 +33,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project root directory (defaults to the current directory).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser(
+        "login",
+        help="Open the dedicated browser profile for Weibo QR login.",
+    )
+
+    subparsers.add_parser(
+        "doctor",
+        help="Check packages, browser, storage, and Weibo session state.",
+    )
 
     add = subparsers.add_parser("add", help="Create a draft post.")
     add.add_argument("--text", required=True, help="Post body text.")
@@ -72,9 +86,13 @@ def _fail(message: str) -> int:
     return 2
 
 
-def _repository_from_args(args: argparse.Namespace) -> tuple[JobRepository, object]:
+def _config_from_args(args: argparse.Namespace):
     root = (args.root or Path.cwd()).resolve()
-    config = load_config(root=root)
+    return load_config(root=root)
+
+
+def _repository_from_args(args: argparse.Namespace) -> tuple[JobRepository, object]:
+    config = _config_from_args(args)
     ensure_runtime_dirs(config)
     repo = JobRepository(config.db_path)
     repo.initialize()
@@ -130,6 +148,38 @@ def _cmd_add(args: argparse.Namespace) -> int:
     print(f"Images: {len(job.images)}")
     print(f"Confirm with: weibo-publisher confirm {job.id}")
     return 0
+
+
+def _cmd_login(args: argparse.Namespace) -> int:
+    config = _config_from_args(args)
+    ensure_runtime_dirs(config)
+    configure_logging(config)
+    try:
+        completed = asyncio.run(login(config))
+    except Exception:
+        logging.getLogger(__name__).exception("Weibo login command failed")
+        return _fail("Weibo login could not be opened")
+    if not completed:
+        print("Login not completed. Run the command again when ready.")
+        return 1
+    print("Login successful. The dedicated profile is ready.")
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    config = _config_from_args(args)
+    ensure_runtime_dirs(config)
+    configure_logging(config)
+    try:
+        checks = asyncio.run(run_doctor(config))
+    except Exception:
+        logging.getLogger(__name__).exception("Doctor command failed")
+        return _fail("doctor could not complete")
+
+    for check in checks:
+        state = "OK" if check.ok else "FAIL"
+        print(f"{check.name}: {state} - {check.detail}")
+    return 0 if all(check.ok for check in checks) else 1
 
 
 def _cmd_confirm(args: argparse.Namespace) -> int:
@@ -273,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     handlers = {
+        "login": _cmd_login,
+        "doctor": _cmd_doctor,
         "add": _cmd_add,
         "show": _cmd_show,
         "confirm": _cmd_confirm,
