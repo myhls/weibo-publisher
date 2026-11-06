@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
 from weibo_publisher.browser import (
     _NAVIGATION_TIMEOUT_MS,
     _SESSION_WAIT_TIMEOUT_SECONDS,
@@ -55,6 +53,11 @@ VISIBILITY_SELECTORS = [
     'button:has-text("群可见")',
     '[class*="visibility"]',
 ]
+_VISIBILITY_CSS_SELECTORS = [
+    selector
+    for selector in VISIBILITY_SELECTORS
+    if ":has-text(" not in selector
+]
 
 _UPLOAD_INDICATOR_SELECTORS = (
     '[class*="upload"][class*="progress"]',
@@ -78,9 +81,280 @@ _KNOWN_VISIBILITY_LABELS = (
     | {_PRIVATE_VISIBILITY_LABEL}
     | _OTHER_VISIBILITY_LABELS
 )
-_VISIBILITY_TIMEOUT_SECONDS = 3.0
-_VISIBILITY_POLL_INTERVAL_SECONDS = 0.1
-_VISIBILITY_PROBE_TIMEOUT_MS = 500
+_VISIBILITY_TIMEOUT_SECONDS = 5.0
+_VISIBILITY_POLL_INTERVAL_SECONDS = 0.05
+_VISIBILITY_CLICK_TIMEOUT_MS = 1_000
+_VISIBILITY_TRIGGER_MARKER = "data-codex-visibility-trigger"
+_VISIBILITY_OPTION_MARKER = "data-codex-visibility-option"
+
+_VISIBILITY_SNAPSHOT_SCRIPT = """
+(root, { knownLabels, selectors, triggerMarker, optionMarker }) => {
+  const empty = () => ({
+    label: null,
+    labels: [],
+    triggerMarked: false,
+  });
+  if (
+    !(root instanceof HTMLElement) ||
+    root === document.body ||
+    root === document.documentElement
+  ) {
+    return empty();
+  }
+
+  const normalize = (value) =>
+    String(value ?? "").replace(/\\s+/g, " ").trim();
+  const known = new Set(knownLabels);
+  const isVisible = (element) => {
+    if (
+      element.hidden ||
+      element.getAttribute("aria-hidden") === "true" ||
+      element.getClientRects().length === 0
+    ) {
+      return false;
+    }
+    const style = getComputedStyle(element);
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.visibility !== "collapse" &&
+      Number(style.opacity) !== 0
+    );
+  };
+  const isDisabled = (element) =>
+    element.matches(":disabled") ||
+    element.getAttribute("aria-disabled") === "true";
+  const exactLabel = (element) => {
+    const values = [
+      element.innerText ?? "",
+      element.textContent ?? "",
+      element.getAttribute("aria-label") ?? "",
+      element.getAttribute("data-visibility") ?? "",
+    ];
+    for (const value of values) {
+      const label = normalize(value);
+      if (known.has(label)) {
+        return label;
+      }
+    }
+    return null;
+  };
+
+  for (const marked of root.querySelectorAll(
+    `[${triggerMarker}], [${optionMarker}]`
+  )) {
+    marked.removeAttribute(triggerMarker);
+    marked.removeAttribute(optionMarker);
+  }
+
+  const selectorSet = new Set([
+    ...selectors,
+    "button",
+    "a",
+    '[role="button"]',
+    "[aria-haspopup]",
+  ]);
+  const candidates = root.querySelectorAll(Array.from(selectorSet).join(","));
+  const labels = [];
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (const candidate of candidates) {
+    if (
+      !(candidate instanceof HTMLElement) ||
+      !isVisible(candidate) ||
+      isDisabled(candidate)
+    ) {
+      continue;
+    }
+    const label = exactLabel(candidate);
+    if (label === null) {
+      continue;
+    }
+    if (!labels.includes(label)) {
+      labels.push(label);
+    }
+
+    const semanticTrigger = candidate.matches(
+      'button, a, [role="button"], [data-visibility], ' +
+      '[data-testid="visibility"], [id*="visibility"], ' +
+      '[class*="visibility"]'
+    );
+    const selectedTrigger = candidate.matches(selectors.join(","));
+    if (!semanticTrigger && !selectedTrigger) {
+      continue;
+    }
+
+    let score = 0;
+    if (candidate.matches('button, a, [role="button"]')) {
+      score += 20;
+    }
+    if (candidate.matches('[data-visibility], [data-testid="visibility"]')) {
+      score += 50;
+    }
+    if (candidate.matches('[id*="visibility"], [class*="visibility"]')) {
+      score += 20;
+    }
+    if (normalize(candidate.getAttribute("aria-label") ?? "") === label) {
+      score += 15;
+    }
+    if (candidate.hasAttribute("aria-haspopup")) {
+      score += 25;
+    }
+    if (normalize(candidate.innerText || candidate.textContent || "") === label) {
+      score += 10;
+    }
+    if (score > bestScore) {
+      best = { element: candidate, label };
+      bestScore = score;
+    }
+  }
+
+  if (best !== null) {
+    best.element.setAttribute(triggerMarker, "true");
+  }
+  return {
+    label: best?.label ?? labels[0] ?? null,
+    labels,
+    triggerMarked: best !== null,
+  };
+}
+"""
+
+_VISIBILITY_DISCOVERY_SCRIPT = """
+(root, { knownLabels, selectors }) => {
+  if (
+    !(root instanceof HTMLElement) ||
+    root === document.body ||
+    root === document.documentElement
+  ) {
+    return false;
+  }
+  const normalize = (value) =>
+    String(value ?? "").replace(/\\s+/g, " ").trim();
+  const known = new Set(knownLabels);
+  const isVisible = (element) => {
+    if (
+      element.hidden ||
+      element.getAttribute("aria-hidden") === "true" ||
+      element.getClientRects().length === 0
+    ) {
+      return false;
+    }
+    const style = getComputedStyle(element);
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.visibility !== "collapse" &&
+      Number(style.opacity) !== 0
+    );
+  };
+  const selectorSet = new Set([
+    ...selectors,
+    "button",
+    "a",
+    '[role="button"]',
+    "[aria-haspopup]",
+  ]);
+  for (const candidate of root.querySelectorAll(
+    Array.from(selectorSet).join(",")
+  )) {
+    if (
+      !(candidate instanceof HTMLElement) ||
+      !isVisible(candidate) ||
+      candidate.matches(":disabled") ||
+      candidate.getAttribute("aria-disabled") === "true"
+    ) {
+      continue;
+    }
+    const labels = [
+      candidate.innerText ?? "",
+      candidate.textContent ?? "",
+      candidate.getAttribute("aria-label") ?? "",
+      candidate.getAttribute("data-visibility") ?? "",
+    ].map(normalize);
+    if (labels.some((label) => known.has(label))) {
+      return true;
+    }
+  }
+  return false;
+}
+"""
+
+_VISIBILITY_OPTION_SCRIPT = """
+(root, { targetLabel, triggerMarker, optionMarker }) => {
+  if (!(root instanceof HTMLElement)) {
+    return false;
+  }
+  const normalize = (value) =>
+    String(value ?? "").replace(/\\s+/g, " ").trim();
+  const target = normalize(targetLabel);
+  const isVisible = (element) => {
+    if (
+      element.hidden ||
+      element.getAttribute("aria-hidden") === "true" ||
+      element.getClientRects().length === 0
+    ) {
+      return false;
+    }
+    const style = getComputedStyle(element);
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.visibility !== "collapse" &&
+      Number(style.opacity) !== 0
+    );
+  };
+
+  for (const marked of root.querySelectorAll(`[${optionMarker}]`)) {
+    marked.removeAttribute(optionMarker);
+  }
+  const candidates = root.querySelectorAll("*");
+  let best = null;
+  let bestScore = -Infinity;
+  for (const candidate of candidates) {
+    if (
+      !(candidate instanceof HTMLElement) ||
+      candidate.matches(`[${triggerMarker}]`) ||
+      !isVisible(candidate) ||
+      candidate.matches(":disabled") ||
+      candidate.getAttribute("aria-disabled") === "true"
+    ) {
+      continue;
+    }
+    const values = [
+      candidate.innerText ?? "",
+      candidate.textContent ?? "",
+      candidate.getAttribute("aria-label") ?? "",
+      candidate.getAttribute("data-visibility") ?? "",
+    ].map(normalize);
+    if (values.includes(target)) {
+      let score = 0;
+      if (candidate.matches('button, a, [role="button"], [role="menuitem"]')) {
+        score += 30;
+      }
+      if (candidate.matches('[role="option"], li')) {
+        score += 20;
+      }
+      if (candidate.matches('[data-visibility], [data-testid="visibility"]')) {
+        score += 20;
+      }
+      if (candidate.matches('[class*="visibility"]')) {
+        score += 10;
+      }
+      if (score > bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+  }
+  if (best === null) {
+    return false;
+  }
+  best.setAttribute(optionMarker, "true");
+  return true;
+}
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +362,13 @@ class _AttachedImageIdentity:
     name: str
     size: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _VisibilitySnapshot:
+    label: str | None
+    labels: tuple[str, ...]
+    trigger_marked: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,16 +613,19 @@ async def _has_visible_control(
     return False
 
 
-async def _has_visible_visibility_control(root: Page | Locator) -> bool:
-    if await _has_visible_control(root, VISIBILITY_SELECTORS):
-        return True
-
-    for label in _KNOWN_VISIBILITY_LABELS:
-        locator = root.get_by_text(label, exact=True)
-        for index in range(await locator.count()):
-            if await locator.nth(index).is_visible():
-                return True
-    return False
+async def _has_visible_visibility_control(root: Locator) -> bool:
+    try:
+        return bool(
+            await root.evaluate(
+                _VISIBILITY_DISCOVERY_SCRIPT,
+                {
+                    "knownLabels": sorted(_KNOWN_VISIBILITY_LABELS),
+                    "selectors": _VISIBILITY_CSS_SELECTORS,
+                },
+            )
+        )
+    except Exception:  # noqa: BLE001 - a detached ancestor is not a match
+        return False
 
 
 def parse_publish_response(payload: dict) -> PublishResult:
@@ -595,9 +879,8 @@ async def _validate_submit_page(
         raise RuntimeError("image upload has not completed")
 
     composer_region = await _active_composer_region(composer)
-    visibility_label = await _read_visibility_label(composer_region)
-    if visibility_label is None:
-        raise RuntimeError("visibility could not be verified before submit")
+    snapshot = await _wait_for_visibility_snapshot(composer_region)
+    visibility_label = snapshot.label
     expected_labels = _visibility_labels_for(visibility)
     if visibility_label not in expected_labels:
         raise RuntimeError(
@@ -689,23 +972,128 @@ def _parse_attached_image_identities(
     return tuple(identities)
 
 
-async def _read_visibility_label(composer_region: Locator) -> str | None:
-    for selector in VISIBILITY_SELECTORS:
-        locator = composer_region.locator(selector)
-        for index in range(await locator.count()):
-            candidate = locator.nth(index)
-            if not await candidate.is_visible():
-                continue
-            label = await _visibility_label_for(candidate)
-            if label is not None:
-                return label
+async def _read_visibility_snapshot(
+    composer_region: Locator,
+    *,
+    timeout_ms: int | None = None,
+) -> _VisibilitySnapshot:
+    try:
+        raw_snapshot = await composer_region.evaluate(
+            _VISIBILITY_SNAPSHOT_SCRIPT,
+            {
+                "knownLabels": sorted(_KNOWN_VISIBILITY_LABELS),
+                "selectors": _VISIBILITY_CSS_SELECTORS,
+                "triggerMarker": _VISIBILITY_TRIGGER_MARKER,
+                "optionMarker": _VISIBILITY_OPTION_MARKER,
+            },
+            timeout=timeout_ms,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Weibo visibility snapshot could not be read safely: {exc}"
+        ) from exc
 
-    for label in _KNOWN_VISIBILITY_LABELS:
-        locator = composer_region.get_by_text(label, exact=True)
-        for index in range(await locator.count()):
-            if await locator.nth(index).is_visible():
-                return label
-    return None
+    if not isinstance(raw_snapshot, dict):
+        raise RuntimeError(  # noqa: TRY004 - browser data must fail closed
+            "Weibo visibility snapshot returned invalid data"
+        )
+    raw_label = raw_snapshot.get("label")
+    raw_labels = raw_snapshot.get("labels")
+    raw_trigger_marked = raw_snapshot.get("triggerMarked")
+    if raw_label is not None and (
+        not isinstance(raw_label, str)
+        or raw_label not in _KNOWN_VISIBILITY_LABELS
+    ):
+        raise RuntimeError("Weibo visibility snapshot returned an invalid label")
+    if not isinstance(raw_labels, list) or any(
+        not isinstance(label, str) or label not in _KNOWN_VISIBILITY_LABELS
+        for label in raw_labels
+    ):
+        raise RuntimeError("Weibo visibility snapshot returned invalid labels")
+    if not isinstance(raw_trigger_marked, bool):
+        raise RuntimeError(  # noqa: TRY004 - browser data must fail closed
+            "Weibo visibility snapshot returned invalid trigger state"
+        )
+    if raw_label is not None and raw_label not in raw_labels:
+        raise RuntimeError(
+            "Weibo visibility snapshot label was not present in its labels"
+        )
+    if raw_trigger_marked and raw_label is None:
+        raise RuntimeError(
+            "Weibo visibility snapshot marked a trigger without a label"
+        )
+    return _VisibilitySnapshot(
+        label=raw_label,
+        labels=tuple(raw_labels),
+        trigger_marked=raw_trigger_marked,
+    )
+
+
+async def _wait_for_visibility_snapshot(
+    composer_region: Locator,
+    *,
+    expected_labels: frozenset[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> _VisibilitySnapshot:
+    expected = expected_labels or _KNOWN_VISIBILITY_LABELS
+    wait_seconds = (
+        _VISIBILITY_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(timeout_seconds, 0)
+    )
+    deadline = time.monotonic() + wait_seconds
+    current: str | None = None
+    last_error: Exception | None = None
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            snapshot = await _read_visibility_snapshot(
+                composer_region,
+                timeout_ms=max(1, int(remaining * 1_000)),
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            snapshot = None
+        if (
+            snapshot is not None
+            and snapshot.label in expected
+            and snapshot.trigger_marked
+        ):
+            return snapshot
+        if snapshot is not None:
+            current = snapshot.label
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(
+            min(_VISIBILITY_POLL_INTERVAL_SECONDS, remaining)
+        )
+
+    expected_label = (
+        " / ".join(sorted(expected))
+        if expected != _KNOWN_VISIBILITY_LABELS
+        else None
+    )
+    detail = (
+        f"expected label {expected_label} was not selected; "
+        f"current label is {current or 'unavailable'}"
+        if expected_label is not None
+        else (
+            "no current trigger and label appeared before the readiness "
+            f"timeout; current label is {current or 'unavailable'}"
+        )
+    )
+    error = RuntimeError(
+        f"Weibo visibility could not be verified: {detail} "
+        f"within {wait_seconds:.1f}s"
+    )
+    if last_error is not None:
+        raise error from last_error
+    raise error
 
 
 async def _ensure_visibility(
@@ -718,144 +1106,96 @@ async def _ensure_visibility(
         if visibility is Visibility.PRIVATE
         else "公开"
     )
-    current = await _read_visibility_label(composer_region)
-    if current in expected_labels:
+    snapshot = await _wait_for_visibility_snapshot(composer_region)
+    if snapshot.label in expected_labels:
         return
 
-    if current not in _KNOWN_VISIBILITY_LABELS:
-        current_label = current or "unavailable"
+    if snapshot.label not in _KNOWN_VISIBILITY_LABELS:
+        current_label = snapshot.label or "unavailable"
         raise RuntimeError(
             f"Weibo visibility {target_label} could not be selected; "
             f"current composer label is {current_label}"
         )
 
-    trigger = await _find_visibility_trigger(composer_region)
-    await trigger.click()
-    option = await _first_visible_exact_text(
+    await _click_marked_visibility_element(
         composer_region,
-        target_label,
+        _VISIBILITY_TRIGGER_MARKER,
+        "visibility trigger",
     )
-    await option.click()
-    await _wait_for_locator_visibility(trigger, visibility)
+    await _wait_for_visibility_option(composer_region, target_label)
+    await _click_marked_visibility_element(
+        composer_region,
+        _VISIBILITY_OPTION_MARKER,
+        f"visibility option {target_label}",
+    )
+    await _wait_for_visibility_snapshot(
+        composer_region,
+        expected_labels=expected_labels,
+    )
 
 
-async def _find_visibility_trigger(composer_region: Locator) -> Locator:
-    fallback: Locator | None = None
-    for selector in VISIBILITY_SELECTORS:
-        locator = composer_region.locator(selector)
-        for index in range(await locator.count()):
-            candidate = locator.nth(index)
-            if not await candidate.is_visible():
-                continue
-            if await _visibility_label_for(candidate) is not None:
-                if await _is_interactive_visibility_trigger(candidate):
-                    return candidate
-                if fallback is None:
-                    fallback = candidate
-
-    for label in _KNOWN_VISIBILITY_LABELS:
-        locator = composer_region.get_by_text(label, exact=True)
-        for index in range(await locator.count()):
-            candidate = locator.nth(index)
-            if not await candidate.is_visible():
-                continue
-            if await _is_interactive_visibility_trigger(candidate):
-                return candidate
-            if fallback is None:
-                fallback = candidate
-    if fallback is not None:
-        return fallback
-    raise RuntimeError("Weibo visibility control could not be found")
-
-
-async def _is_interactive_visibility_trigger(candidate: Locator) -> bool:
-    try:
-        return bool(
-            await candidate.evaluate(
-                """
-                (element) => element.matches(
-                  'button, a, [role="button"], [data-visibility], ' +
-                  '[data-testid="visibility"]'
-                )
-                """,
-                timeout=_VISIBILITY_PROBE_TIMEOUT_MS,
-            )
-        )
-    except Exception:  # noqa: BLE001 - fall back to another candidate
-        return False
-
-
-async def _first_visible_exact_text(
+async def _wait_for_visibility_option(
     composer_region: Locator,
-    text: str,
-) -> Locator:
-    locator = composer_region.get_by_text(text, exact=True)
-    for index in range(await locator.count()):
-        candidate = locator.nth(index)
-        if await candidate.is_visible():
-            return candidate
-    raise RuntimeError(f"Weibo visibility option {text} could not be found")
-
-
-async def _visibility_label_for(candidate: Locator) -> str | None:
-    try:
-        values = await candidate.evaluate(
-            """
-            (element) => [
-              element.innerText ?? "",
-              element.textContent ?? "",
-              element.getAttribute("aria-label") ?? "",
-              element.getAttribute("data-visibility") ?? "",
-            ]
-            """,
-            timeout=_VISIBILITY_PROBE_TIMEOUT_MS,
-        )
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError(
-            "Weibo visibility label could not be read within "
-            f"{_VISIBILITY_PROBE_TIMEOUT_MS}ms"
-        ) from exc
-    except Exception as exc:
-        raise RuntimeError(
-            f"Weibo visibility label could not be read safely: {exc}"
-        ) from exc
-
-    if not isinstance(values, list):
-        raise RuntimeError(  # noqa: TRY004 - browser data must fail closed
-            "Weibo visibility label probe returned invalid data"
-        )
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        label = normalize_text(value)
-        if label in _KNOWN_VISIBILITY_LABELS:
-            return label
-    return None
-
-
-async def _wait_for_locator_visibility(
-    locator: Locator,
-    visibility: Visibility,
+    target_label: str,
 ) -> None:
-    expected_labels = _visibility_labels_for(visibility)
-    expected_label = (
-        _PRIVATE_VISIBILITY_LABEL
-        if visibility is Visibility.PRIVATE
-        else "公开"
-    )
     deadline = time.monotonic() + _VISIBILITY_TIMEOUT_SECONDS
-    current: str | None = None
+    last_error: Exception | None = None
     while True:
-        current = await _visibility_label_for(locator)
-        if current in expected_labels:
-            return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(
-                f"Weibo visibility {expected_label} could not be verified; "
-                f"current label is {current or 'unavailable'}"
+            break
+        try:
+            marked = await composer_region.evaluate(
+                _VISIBILITY_OPTION_SCRIPT,
+                {
+                    "targetLabel": target_label,
+                    "triggerMarker": _VISIBILITY_TRIGGER_MARKER,
+                    "optionMarker": _VISIBILITY_OPTION_MARKER,
+                },
+                timeout=max(1, int(remaining * 1_000)),
             )
+        except Exception as exc:  # noqa: BLE001 - retry until readiness deadline
+            last_error = exc
+            marked = False
+        if marked is True:
+            return
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         await asyncio.sleep(min(_VISIBILITY_POLL_INTERVAL_SECONDS, remaining))
+
+    error = RuntimeError(
+        f"Weibo visibility option {target_label} could not be selected "
+        f"within {_VISIBILITY_TIMEOUT_SECONDS:.1f}s"
+    )
+    if last_error is not None:
+        raise error from last_error
+    raise error
+
+
+async def _click_marked_visibility_element(
+    composer_region: Locator,
+    marker: str,
+    description: str,
+) -> None:
+    marked = composer_region.locator(f'[{marker}="true"]')
+    try:
+        clicked = await marked.evaluate(
+            """
+            (element) => {
+              element.click();
+              return true;
+            }
+            """,
+            timeout=_VISIBILITY_CLICK_TIMEOUT_MS,
+        )
+        if clicked is not True:
+            raise RuntimeError("marked element did not accept the click")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Weibo {description} could not be clicked safely: {exc}"
+        ) from exc
 
 
 def _visibility_labels_for(visibility: Visibility) -> frozenset[str]:

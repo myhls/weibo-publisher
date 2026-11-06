@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -76,18 +77,52 @@ async def test_prepare_fails_before_click_without_non_page_common_ancestor(
 
 
 @pytest.mark.asyncio
-async def test_visibility_label_probe_fails_closed_when_control_disappears() -> None:
-    async with _local_page(_page_html(has_common_ancestor=True)) as page:
-        visibility = page.locator("#visibility")
-        assert await visibility.count() == 1
-        await visibility.evaluate("(element) => element.remove()")
+async def test_prepare_survives_repeated_visibility_control_rebuilds(
+    tmp_path: Path,
+) -> None:
+    async with _local_page(_dynamic_visibility_page_html()) as page:
+        region = page.locator("#composer-shell")
+        await asyncio.sleep(0.35)
 
+        snapshot = await weibo._read_visibility_snapshot(region)
+
+        assert snapshot.label == "公开"
+        assert snapshot.trigger_marked is True
+        assert await page.evaluate("window.visibilityRebuildCount") >= 2
+
+        artifact_dir = tmp_path / "artifacts"
+        artifact_dir.mkdir()
+        await weibo._prepare_page(
+            page,
+            "dynamic visibility",
+            [],
+            Visibility.PRIVATE,
+            artifact_dir,
+        )
+
+        assert await page.locator("#body").input_value() == "dynamic visibility"
+        assert await page.locator("#current-visibility").inner_text() == "仅自己可见"
+        assert await page.evaluate("window.publishClickCount ?? 0") == 0
+        assert await page.evaluate("window.editorClickCount ?? 0") == 0
+        assert (artifact_dir / "preview.png").is_file()
+
+
+@pytest.mark.asyncio
+async def test_visibility_selection_fails_closed_before_control_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(weibo, "_VISIBILITY_TIMEOUT_SECONDS", 0.3)
+    async with _local_page(_stalled_visibility_page_html()) as page:
+        region = page.locator("#composer-shell")
         started = time.monotonic()
-        with pytest.raises(RuntimeError, match="visibility label could not be read"):
-            await weibo._visibility_label_for(visibility)
+
+        with pytest.raises(RuntimeError, match="visibility"):
+            await weibo._ensure_visibility(region, Visibility.PRIVATE)
         elapsed = time.monotonic() - started
 
         assert elapsed < 2.0
+        assert await page.evaluate("window.publishClickCount ?? 0") == 0
+        assert await page.evaluate("window.editorClickCount ?? 0") == 0
 
 
 @asynccontextmanager
@@ -187,6 +222,99 @@ def _page_html(*, has_common_ancestor: bool) -> str:
               window.editorClickCount =
                 (window.editorClickCount ?? 0) + 1;
             }});
+          </script>
+        </body>
+      </html>
+    """
+
+
+def _dynamic_visibility_page_html() -> str:
+    return """
+      <!doctype html>
+      <html>
+        <body>
+          <header><a class="gn_name" href="/u/123">Account</a></header>
+          <main id="composer-shell">
+            <textarea id="body" placeholder="分享新鲜事"></textarea>
+            <section id="visibility-slot"></section>
+            <div id="visibility-options" hidden>
+              <button type="button">公开</button>
+              <button type="button">仅自己可见</button>
+            </div>
+            <button id="publish" type="button">发送</button>
+          </main>
+          <script>
+            let currentLabel = "公开";
+            let generation = 0;
+            const slot = document.querySelector("#visibility-slot");
+            const options = document.querySelector("#visibility-options");
+            let rebuildTimer;
+
+            const renderTrigger = () => {
+              generation += 1;
+              window.visibilityRebuildCount =
+                (window.visibilityRebuildCount ?? 0) + 1;
+              const trigger = document.createElement("button");
+              trigger.type = "button";
+              trigger.id = "current-visibility";
+              trigger.className = "audience-selector";
+              trigger.dataset.audienceControl = String(generation);
+              trigger.textContent = currentLabel;
+              trigger.setAttribute("aria-label", currentLabel);
+              trigger.setAttribute("aria-haspopup", "listbox");
+              trigger.addEventListener("click", () => {
+                clearInterval(rebuildTimer);
+                options.hidden = false;
+              });
+              slot.replaceChildren(trigger);
+            };
+
+            for (const option of options.querySelectorAll("button")) {
+              option.addEventListener("click", () => {
+                currentLabel = option.textContent;
+                options.hidden = true;
+                renderTrigger();
+              });
+            }
+
+            renderTrigger();
+            rebuildTimer = setInterval(renderTrigger, 150);
+          </script>
+          <script>
+            document.querySelector("#publish").addEventListener("click", () => {
+              window.publishClickCount =
+                (window.publishClickCount ?? 0) + 1;
+            });
+            document.querySelector("#body").addEventListener("click", () => {
+              window.editorClickCount =
+                (window.editorClickCount ?? 0) + 1;
+            });
+          </script>
+        </body>
+      </html>
+    """
+
+
+def _stalled_visibility_page_html() -> str:
+    return """
+      <!doctype html>
+      <html>
+        <body>
+          <header><a class="gn_name" href="/u/123">Account</a></header>
+          <main id="composer-shell">
+            <textarea id="body" placeholder="分享新鲜事"></textarea>
+            <section id="visibility-slot"></section>
+            <button id="publish" type="button">发送</button>
+          </main>
+          <script>
+            document.querySelector("#publish").addEventListener("click", () => {
+              window.publishClickCount =
+                (window.publishClickCount ?? 0) + 1;
+            });
+            document.querySelector("#body").addEventListener("click", () => {
+              window.editorClickCount =
+                (window.editorClickCount ?? 0) + 1;
+            });
           </script>
         </body>
       </html>
