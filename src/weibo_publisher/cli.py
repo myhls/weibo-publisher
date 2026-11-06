@@ -77,6 +77,12 @@ def _build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="Show job attempts and artifacts.")
     status.add_argument("job_id")
 
+    preview = subparsers.add_parser(
+        "preview",
+        help="Fill a draft or approved job in Weibo without publishing.",
+    )
+    preview.add_argument("job_id")
+
     return parser
 
 
@@ -322,6 +328,35 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_preview(args: argparse.Namespace) -> int:
+    repo, config = _repository_from_args(args)
+    job = repo.get_job(args.job_id)
+    if job is None:
+        return _fail(f"job not found: {args.job_id}")
+    if job.status not in {JobStatus.DRAFT, JobStatus.APPROVED}:
+        return _fail(f"cannot preview a {job.status.value} job")
+
+    try:
+        validate_images(job.images)
+    except ValueError as exc:
+        return _fail(str(exc))
+
+    artifact_dir = config.artifacts_dir / job.id
+    try:
+        from weibo_publisher.weibo import preview_job
+
+        asyncio.run(preview_job(config, job, artifact_dir))
+    except RuntimeError as exc:
+        logging.getLogger(__name__).exception("Weibo preview failed")
+        return _fail(f"preview failed: {exc}")
+    except Exception:
+        logging.getLogger(__name__).exception("Weibo preview failed")
+        return _fail("preview failed")
+
+    print(f"Preview saved: {artifact_dir / 'preview.png'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -334,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         "list": _cmd_list,
         "cancel": _cmd_cancel,
         "status": _cmd_status,
+        "preview": _cmd_preview,
     }
     return handlers[args.command](args)
 
