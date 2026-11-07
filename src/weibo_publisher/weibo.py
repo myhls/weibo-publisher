@@ -1364,34 +1364,14 @@ async def _ensure_visibility(
         )
 
     page = composer_region.page
-    owner_token = uuid4().hex
+    baseline_token = await _mark_visible_exact_text_nodes(page, target_label)
+    trigger = await _first_visible_exact_text(composer_region, snapshot.label)
+    await trigger.click()
     try:
-        trigger_label = await _wait_for_visibility_action(
-            composer_region,
-            _VISIBILITY_SNAPSHOT_SCRIPT,
-            {
-                "knownLabels": sorted(_KNOWN_VISIBILITY_LABELS),
-                "selectors": _VISIBILITY_CSS_SELECTORS,
-                "triggerAction": True,
-                "ownerToken": owner_token,
-            },
-            "visibility trigger",
-        )
-        if trigger_label.label in expected_labels:
-            await _wait_for_visibility_snapshot(
-                composer_region,
-                expected_labels=expected_labels,
-            )
-            return
-
-        await _wait_for_visibility_action(
+        await _wait_for_new_exact_text_action(
             page,
-            _VISIBILITY_PORTAL_OPTION_SCRIPT,
-            {
-                "ownerToken": owner_token,
-                "targetLabel": target_label,
-            },
-            f"visibility option {target_label}",
+            target_label,
+            baseline_token,
         )
         await _wait_for_visibility_snapshot(
             composer_region,
@@ -1404,21 +1384,171 @@ async def _ensure_visibility(
                 (token) => {
                   document
                     .querySelectorAll(
-                      `[data-codex-visibility-owner="${token}"], ` +
-                      `[data-codex-visibility-baseline="${token}"]`,
+                      `[data-codex-text-baseline="${token}"]`,
                     )
                     .forEach((element) => {
-                      element.removeAttribute(
-                        "data-codex-visibility-owner",
-                      );
-                      element.removeAttribute(
-                        "data-codex-visibility-baseline",
-                      );
+                      element.removeAttribute("data-codex-text-baseline");
                     });
                 }
                 """,
-                owner_token,
+                baseline_token,
             )
+
+
+async def _mark_visible_exact_text_nodes(page: Page, text: str) -> str:
+    token = uuid4().hex
+    await page.evaluate(
+        """
+        ({ token, text }) => {
+          const normalize = (value) =>
+            String(value ?? "").replace(/\\s+/g, " ").trim();
+          const isVisible = (element) => {
+            if (
+              !(element instanceof HTMLElement) ||
+              element.hidden ||
+              element.getClientRects().length === 0
+            ) {
+              return false;
+            }
+            const style = getComputedStyle(element);
+            return (
+              style.display !== "none" &&
+              style.visibility !== "hidden" &&
+              Number(style.opacity) !== 0
+            );
+          };
+          for (const element of document.querySelectorAll(
+            "button, a, [role=button], [role=option], " +
+            "[role=menuitem], [role=menuitemradio], li, div, span",
+          )) {
+            if (
+              isVisible(element) &&
+              normalize(element.innerText || element.textContent) === text
+            ) {
+              element.setAttribute("data-codex-text-baseline", token);
+            }
+          }
+        }
+        """,
+        {"token": token, "text": text},
+    )
+    return token
+
+
+async def _first_visible_exact_text(
+    composer_region: Locator,
+    text: str,
+) -> Locator:
+    locator = composer_region.get_by_text(text, exact=True)
+    for index in range(await locator.count()):
+        candidate = locator.nth(index)
+        if await candidate.is_visible():
+            return candidate
+    raise RuntimeError(f"Weibo visibility trigger {text} could not be found")
+
+
+async def _wait_for_new_exact_text_action(
+    page: Page,
+    text: str,
+    baseline_token: str,
+) -> None:
+    deadline = time.monotonic() + _VISIBILITY_TIMEOUT_SECONDS
+    last_error: Exception | None = None
+    while True:
+        try:
+            acted = await page.evaluate(
+                """
+                ({ text, token }) => {
+                  const normalize = (value) =>
+                    String(value ?? "").replace(/\\s+/g, " ").trim();
+                  const isVisible = (element) => {
+                    if (
+                      !(element instanceof HTMLElement) ||
+                      element.hidden ||
+                      element.getAttribute("aria-hidden") === "true" ||
+                      element.getClientRects().length === 0
+                    ) {
+                      return false;
+                    }
+                    const style = getComputedStyle(element);
+                    return (
+                      style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      Number(style.opacity) !== 0
+                    );
+                  };
+                  let best = null;
+                  let bestScore = 0;
+                  for (const element of document.querySelectorAll(
+                    "button, a, [role=button], [role=option], " +
+                    "[role=menuitem], [role=menuitemradio], " +
+                    "[role=radio], li, [tabindex]",
+                  )) {
+                    if (
+                      !isVisible(element) ||
+                      element.getAttribute(
+                        "data-codex-text-baseline",
+                      ) === token ||
+                      normalize(
+                        element.innerText || element.textContent,
+                      ) !== text
+                    ) {
+                      continue;
+                    }
+                    let score = 0;
+                    if (element.matches("button, a, [role=button]")) {
+                      score += 20;
+                    }
+                    if (
+                      element.matches(
+                        "[role=option], [role=menuitem], " +
+                        "[role=menuitemradio], [role=radio]",
+                      )
+                    ) {
+                      score += 50;
+                    }
+                    if (element.matches("li, [tabindex]")) {
+                      score += 10;
+                    }
+                    if (score > bestScore) {
+                      best = element;
+                      bestScore = score;
+                    }
+                  }
+                  if (best === null) {
+                    return false;
+                  }
+                  best.click();
+                  return true;
+                }
+                """,
+                {"text": text, "token": baseline_token},
+            )
+        except Exception as exc:  # noqa: BLE001 - retry until deadline
+            last_error = exc
+            acted = False
+        if acted is True:
+            return
+        if acted is not False:
+            raise RuntimeError(
+                "Weibo visibility option action returned invalid data"
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(
+            min(_VISIBILITY_POLL_INTERVAL_SECONDS, remaining)
+        )
+
+    error = RuntimeError(
+        f"Weibo visibility option {text} did not appear in the popup opened "
+        f"by the current composer trigger within "
+        f"{_VISIBILITY_TIMEOUT_SECONDS:.1f}s"
+    )
+    if last_error is not None:
+        raise error from last_error
+    raise error
 
 
 async def _wait_for_visibility_action(
