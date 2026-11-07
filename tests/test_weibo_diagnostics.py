@@ -57,6 +57,24 @@ async def test_failure_diagnostics_save_composer_and_popover_structure(
     assert "仅自己可见" in popovers_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.asyncio
+async def test_visibility_trigger_uses_interactive_wrapper_not_inner_text() -> None:
+    async with _local_page(_wrapped_trigger_html()) as page:
+        region = page.locator("#composer-shell")
+
+        snapshot = await weibo._read_visibility_snapshot(region)
+        token = await weibo._mark_visible_exact_text_nodes(page, "仅自己可见")
+        await weibo._click_current_visibility_trigger(region, snapshot.label)
+
+        assert await page.evaluate("window.wrapperClickCount") == 1
+        await weibo._wait_for_new_exact_text_action(
+            page,
+            "仅自己可见",
+            token,
+        )
+        assert await page.locator("#current-visibility").inner_text() == "仅自己可见"
+
+
 @asynccontextmanager
 async def _local_page(html: str) -> AsyncIterator[Page]:
     async with async_playwright() as playwright:
@@ -87,6 +105,12 @@ def _portal_html(*, open_portal: bool = False) -> str:
     return f"""
       <!doctype html>
       <html>
+        <style>
+          #composer-shell {{ position: relative; width: 600px; height: 160px; }}
+          #body {{ width: 500px; height: 50px; }}
+          #limits {{ position: absolute; left: 380px; top: 80px; }}
+          #publish {{ position: absolute; left: 450px; top: 80px; }}
+        </style>
         <body>
           <header><a class="gn_name" href="/u/123">Account</a></header>
           <main id="composer-shell">
@@ -145,6 +169,52 @@ def _portal_html(*, open_portal: bool = False) -> str:
               window.publishClickCount =
                 (window.publishClickCount ?? 0) + 1;
             }});
+          </script>
+        </body>
+      </html>
+    """
+
+
+def _wrapped_trigger_html() -> str:
+    return """
+      <!doctype html>
+      <html>
+        <style>
+          #composer-shell { position: relative; width: 600px; height: 160px; }
+          #body { width: 500px; height: 50px; }
+          #limits { position: absolute; left: 380px; top: 80px; }
+          #publish { position: absolute; left: 450px; top: 80px; }
+        </style>
+        <body>
+          <main id="composer-shell">
+            <textarea id="body" placeholder="分享新鲜事"></textarea>
+            <div id="limits" class="woo-pop-wrap">
+              <span id="visibility" class="woo-pop-ctrl">
+                <div id="current-visibility">公开</div>
+              </span>
+            </div>
+            <button id="publish" type="button">发送</button>
+          </main>
+          <div id="visibility-menu" role="menu" hidden>
+            <button type="button" role="menuitemradio">仅自己可见</button>
+          </div>
+          <script>
+            const visibility = document.querySelector("#visibility");
+            const current = document.querySelector("#current-visibility");
+            const menu = document.querySelector("#visibility-menu");
+            visibility.addEventListener("click", () => {
+              window.wrapperClickCount =
+                (window.wrapperClickCount ?? 0) + 1;
+              menu.hidden = false;
+            });
+            current.addEventListener("click", () => {
+              window.innerTextClickCount =
+                (window.innerTextClickCount ?? 0) + 1;
+            });
+            menu.querySelector("button").addEventListener("click", () => {
+              current.textContent = "仅自己可见";
+              menu.hidden = true;
+            });
           </script>
         </body>
       </html>

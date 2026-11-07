@@ -145,10 +145,45 @@ _VISIBILITY_SNAPSHOT_SCRIPT = """
     ...selectors,
     "button",
     "a",
+    "div",
+    "span",
     '[role="button"]',
     "[aria-haspopup]",
   ]);
   const candidates = root.querySelectorAll(Array.from(selectorSet).join(","));
+  const composer = [
+    ...root.querySelectorAll(
+      'textarea[placeholder*="分享"], ' +
+      'textarea[placeholder*="新鲜事"], ' +
+      '[contenteditable="true"]',
+    ),
+  ].find(isVisible);
+  const composerRect = composer?.getBoundingClientRect() ?? null;
+  let sendRect = null;
+  let sendDistance = Infinity;
+  for (const control of root.querySelectorAll(
+    'button, a, [role="button"], [class*="submit"]',
+  )) {
+    if (
+      !isVisible(control) ||
+      !/发布|发送/.test(
+        normalize(control.innerText || control.textContent),
+      )
+    ) {
+      continue;
+    }
+    const rect = control.getBoundingClientRect();
+    const distance = composerRect
+      ? Math.hypot(
+          rect.left - composerRect.right,
+          rect.top - composerRect.bottom,
+        )
+      : 0;
+    if (distance < sendDistance) {
+      sendRect = rect;
+      sendDistance = distance;
+    }
+  }
   const labels = [];
   let best = null;
   let bestScore = -Infinity;
@@ -175,11 +210,25 @@ _VISIBILITY_SNAPSHOT_SCRIPT = """
       '[class*="visibility"]'
     );
     const selectedTrigger = candidate.matches(selectors.join(","));
-    if (!semanticTrigger && !selectedTrigger) {
+    const candidateRect = candidate.getBoundingClientRect();
+    const nearSend =
+      sendRect !== null &&
+      Math.abs(
+        candidateRect.left + candidateRect.width / 2 -
+        (sendRect.left + sendRect.width / 2),
+      ) <= 350 &&
+      Math.abs(
+        candidateRect.top + candidateRect.height / 2 -
+        (sendRect.top + sendRect.height / 2),
+      ) <= 160;
+    if (!semanticTrigger && !selectedTrigger && !nearSend) {
       continue;
     }
 
     let score = 0;
+    if (nearSend) {
+      score += 40;
+    }
     if (candidate.matches('button, a, [role="button"]')) {
       score += 20;
     }
@@ -826,28 +875,25 @@ async def _active_composer_region(composer: Locator) -> Locator:
             break
         has_publish_control = await _has_nearby_publish_control(
             parent,
-            composer,
         )
-        has_visibility_control = await _has_visible_visibility_control(parent)
-        if has_publish_control and has_visibility_control:
+        if has_publish_control:
             return parent
         current = parent
     raise RuntimeError(
         "Active Weibo composer region could not be identified: "
         "no non-page ancestor contains a visible publish control near the "
-        "current editor; visibility could not be verified"
+        "current editor"
     )
 
 
 async def _has_nearby_publish_control(
     root: Locator,
-    composer: Locator,
 ) -> bool:
     try:
         return bool(
-            await composer.evaluate(
+            await root.evaluate(
                 """
-                (composer) => {
+                (root) => {
                   const normalize = (value) =>
                     String(value ?? "").replace(/\\s+/g, " ").trim();
                   const isVisible = (element) => {
@@ -865,13 +911,18 @@ async def _has_nearby_publish_control(
                       Number(style.opacity) !== 0
                     );
                   };
-                  const composerRect = composer.getBoundingClientRect();
-                  const currentRoot = composer.closest("form") ??
-                    composer.parentElement?.parentElement;
-                  if (!currentRoot) {
+                  const composer = [
+                    ...root.querySelectorAll(
+                      'textarea[placeholder*="分享"], ' +
+                      'textarea[placeholder*="新鲜事"], ' +
+                      '[contenteditable="true"]',
+                    ),
+                  ].find(isVisible);
+                  if (!composer) {
                     return false;
                   }
-                  for (const control of currentRoot.querySelectorAll(
+                  const composerRect = composer.getBoundingClientRect();
+                  for (const control of root.querySelectorAll(
                     'button, a, [role="button"], [class*="submit"]',
                   )) {
                     if (
@@ -902,7 +953,6 @@ async def _has_nearby_publish_control(
             )
         )
     except Exception:  # noqa: BLE001 - a detached ancestor is not a match
-        _ = root
         return False
 
 
@@ -916,21 +966,6 @@ async def _has_visible_control(
             if await locator.nth(index).is_visible():
                 return True
     return False
-
-
-async def _has_visible_visibility_control(root: Locator) -> bool:
-    try:
-        return bool(
-            await root.evaluate(
-                _VISIBILITY_DISCOVERY_SCRIPT,
-                {
-                    "knownLabels": sorted(_KNOWN_VISIBILITY_LABELS),
-                    "selectors": _VISIBILITY_CSS_SELECTORS,
-                },
-            )
-        )
-    except Exception:  # noqa: BLE001 - a detached ancestor is not a match
-        return False
 
 
 def parse_publish_response(payload: dict) -> PublishResult:
@@ -1505,9 +1540,13 @@ async def _click_current_visibility_trigger(
     composer_region: Locator,
     text: str,
 ) -> None:
-    acted = await composer_region.evaluate(
-        """
-        (root, { text }) => {
+    deadline = time.monotonic() + _VISIBILITY_TIMEOUT_SECONDS
+    while True:
+        token = uuid4().hex
+        try:
+            marked = await composer_region.evaluate(
+                """
+        (root, { text, token }) => {
           const normalize = (value) =>
             String(value ?? "").replace(/\\s+/g, " ").trim();
           const isVisible = (element) => {
@@ -1525,8 +1564,13 @@ async def _click_current_visibility_trigger(
               Number(style.opacity) !== 0
             );
           };
-          const composer = [...root.querySelectorAll("textarea")]
-            .find(isVisible);
+          const composer = [
+            ...root.querySelectorAll(
+              'textarea[placeholder*="分享"], ' +
+              'textarea[placeholder*="新鲜事"], ' +
+              '[contenteditable="true"]',
+            ),
+          ].find(isVisible);
           if (!composer) {
             return false;
           }
@@ -1582,9 +1626,18 @@ async def _click_current_visibility_trigger(
             ) {
               continue;
             }
-            const score =
+            let score =
               Math.abs(centerX - sendX) +
               Math.abs(centerY - sendY) * 2;
+            if (candidate.matches(".woo-pop-ctrl, [aria-haspopup]")) {
+              score -= 500;
+            }
+            if (candidate.matches("button, a, [role=button]")) {
+              score -= 300;
+            }
+            if (candidate.matches(".woo-pop-wrap")) {
+              score -= 100;
+            }
             if (score < bestScore) {
               best = candidate;
               bestScore = score;
@@ -1593,17 +1646,61 @@ async def _click_current_visibility_trigger(
           if (!best) {
             return false;
           }
-          best.click();
+          const clickTarget =
+            best.closest(
+              ".woo-pop-ctrl, [aria-haspopup], button, " +
+              "[role=button], a",
+            ) ??
+            best.closest(".woo-pop-wrap") ??
+            best;
+          clickTarget.setAttribute(
+            "data-codex-visibility-trigger",
+            token,
+          );
           return true;
         }
         """,
-        {"text": text},
+                {"text": text, "token": token},
+            )
+        except Exception:  # noqa: BLE001 - retry bounded dynamic markup
+            marked = False
+
+        if marked is True:
+            trigger = composer_region.page.locator(
+                f'[data-codex-visibility-trigger="{token}"]'
+            ).first
+            click_error: Exception | None = None
+            try:
+                await trigger.click(timeout=1_000)
+                return
+            except Exception as exc:  # noqa: BLE001 - control was rebuilt
+                click_error = exc
+            finally:
+                with suppress(Exception):
+                    await composer_region.page.evaluate(
+                        """
+                        (token) => document
+                          .querySelector(
+                            `[data-codex-visibility-trigger="${token}"]`,
+                          )
+                          ?.removeAttribute(
+                            "data-codex-visibility-trigger",
+                          )
+                        """,
+                        token,
+                    )
+            if click_error is not None:
+                await asyncio.sleep(0)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(_VISIBILITY_POLL_INTERVAL_SECONDS, remaining))
+
+    raise RuntimeError(
+        f"Weibo visibility trigger {text} near the current editor "
+        "could not be clicked"
     )
-    if acted is not True:
-        raise RuntimeError(
-            f"Weibo visibility trigger {text} near the current editor "
-            "could not be clicked"
-        )
 
 
 async def _wait_for_new_exact_text_action(
@@ -1614,10 +1711,11 @@ async def _wait_for_new_exact_text_action(
     deadline = time.monotonic() + _VISIBILITY_TIMEOUT_SECONDS
     last_error: Exception | None = None
     while True:
+        option_token = uuid4().hex
         try:
-            acted = await page.evaluate(
+            marked = await page.evaluate(
                 """
-                ({ text, token }) => {
+                ({ text, token, optionToken }) => {
                   const normalize = (value) =>
                     String(value ?? "").replace(/\\s+/g, " ").trim();
                   const isVisible = (element) => {
@@ -1677,18 +1775,46 @@ async def _wait_for_new_exact_text_action(
                   if (best === null) {
                     return false;
                   }
-                  best.click();
+                  best.setAttribute(
+                    "data-codex-visibility-option",
+                    optionToken,
+                  );
                   return true;
                 }
                 """,
-                {"text": text, "token": baseline_token},
+                {
+                    "text": text,
+                    "token": baseline_token,
+                    "optionToken": option_token,
+                },
             )
         except Exception as exc:  # noqa: BLE001 - retry until deadline
             last_error = exc
-            acted = False
-        if acted is True:
-            return
-        if acted is not False:
+            marked = False
+        if marked is True:
+            option = page.locator(
+                f'[data-codex-visibility-option="{option_token}"]'
+            ).first
+            try:
+                await option.click(timeout=1_000)
+                return
+            except Exception as exc:  # noqa: BLE001 - control was rebuilt
+                last_error = exc
+            finally:
+                with suppress(Exception):
+                    await page.evaluate(
+                        """
+                        (token) => document
+                          .querySelector(
+                            `[data-codex-visibility-option="${token}"]`,
+                          )
+                          ?.removeAttribute(
+                            "data-codex-visibility-option",
+                          )
+                        """,
+                        option_token,
+                    )
+        elif marked is not False:
             raise RuntimeError(
                 "Weibo visibility option action returned invalid data"
             )
