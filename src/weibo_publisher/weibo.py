@@ -824,9 +824,9 @@ async def _active_composer_region(composer: Locator) -> Locator:
         )
         if tag_name in {"body", "html"}:
             break
-        has_publish_control = await _has_visible_control(
+        has_publish_control = await _has_nearby_publish_control(
             parent,
-            PUBLISH_SELECTORS,
+            composer,
         )
         has_visibility_control = await _has_visible_visibility_control(parent)
         if has_publish_control and has_visibility_control:
@@ -834,9 +834,76 @@ async def _active_composer_region(composer: Locator) -> Locator:
         current = parent
     raise RuntimeError(
         "Active Weibo composer region could not be identified: "
-        "no non-page ancestor contains both a visible publish control and "
-        "a visible visibility control; visibility could not be verified"
+        "no non-page ancestor contains a visible publish control near the "
+        "current editor; visibility could not be verified"
     )
+
+
+async def _has_nearby_publish_control(
+    root: Locator,
+    composer: Locator,
+) -> bool:
+    try:
+        return bool(
+            await composer.evaluate(
+                """
+                (composer) => {
+                  const normalize = (value) =>
+                    String(value ?? "").replace(/\\s+/g, " ").trim();
+                  const isVisible = (element) => {
+                    if (
+                      !(element instanceof HTMLElement) ||
+                      element.hidden ||
+                      element.getClientRects().length === 0
+                    ) {
+                      return false;
+                    }
+                    const style = getComputedStyle(element);
+                    return (
+                      style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      Number(style.opacity) !== 0
+                    );
+                  };
+                  const composerRect = composer.getBoundingClientRect();
+                  const currentRoot = composer.closest("form") ??
+                    composer.parentElement?.parentElement;
+                  if (!currentRoot) {
+                    return false;
+                  }
+                  for (const control of currentRoot.querySelectorAll(
+                    'button, a, [role="button"], [class*="submit"]',
+                  )) {
+                    if (
+                      !isVisible(control) ||
+                      !/发布|发送/.test(
+                        normalize(control.innerText || control.textContent),
+                      )
+                    ) {
+                      continue;
+                    }
+                    const rect = control.getBoundingClientRect();
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const composerCenterX =
+                      composerRect.left + composerRect.width / 2;
+                    const composerCenterY =
+                      composerRect.top + composerRect.height / 2;
+                    if (
+                      Math.abs(centerX - composerCenterX) <= 700 &&
+                      Math.abs(centerY - composerCenterY) <= 300
+                    ) {
+                      return true;
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+    except Exception:  # noqa: BLE001 - a detached ancestor is not a match
+        _ = root
+        return False
 
 
 async def _has_visible_control(
@@ -1365,8 +1432,7 @@ async def _ensure_visibility(
 
     page = composer_region.page
     baseline_token = await _mark_visible_exact_text_nodes(page, target_label)
-    trigger = await _first_visible_exact_text(composer_region, snapshot.label)
-    await trigger.click()
+    await _click_current_visibility_trigger(composer_region, snapshot.label)
     try:
         await _wait_for_new_exact_text_action(
             page,
@@ -1435,16 +1501,109 @@ async def _mark_visible_exact_text_nodes(page: Page, text: str) -> str:
     return token
 
 
-async def _first_visible_exact_text(
+async def _click_current_visibility_trigger(
     composer_region: Locator,
     text: str,
-) -> Locator:
-    locator = composer_region.get_by_text(text, exact=True)
-    for index in range(await locator.count()):
-        candidate = locator.nth(index)
-        if await candidate.is_visible():
-            return candidate
-    raise RuntimeError(f"Weibo visibility trigger {text} could not be found")
+) -> None:
+    acted = await composer_region.evaluate(
+        """
+        (root, { text }) => {
+          const normalize = (value) =>
+            String(value ?? "").replace(/\\s+/g, " ").trim();
+          const isVisible = (element) => {
+            if (
+              !(element instanceof HTMLElement) ||
+              element.hidden ||
+              element.getClientRects().length === 0
+            ) {
+              return false;
+            }
+            const style = getComputedStyle(element);
+            return (
+              style.display !== "none" &&
+              style.visibility !== "hidden" &&
+              Number(style.opacity) !== 0
+            );
+          };
+          const composer = [...root.querySelectorAll("textarea")]
+            .find(isVisible);
+          if (!composer) {
+            return false;
+          }
+          const composerRect = composer.getBoundingClientRect();
+          let send = null;
+          let sendDistance = Infinity;
+          for (const control of root.querySelectorAll(
+            'button, a, [role="button"], [class*="submit"]',
+          )) {
+            if (
+              !isVisible(control) ||
+              !/发布|发送/.test(
+                normalize(control.innerText || control.textContent),
+              )
+            ) {
+              continue;
+            }
+            const rect = control.getBoundingClientRect();
+            const distance = Math.hypot(
+              rect.left - composerRect.right,
+              rect.top - composerRect.bottom,
+            );
+            if (distance < sendDistance) {
+              send = control;
+              sendDistance = distance;
+            }
+          }
+          if (!send || sendDistance > 800) {
+            return false;
+          }
+          const sendRect = send.getBoundingClientRect();
+          const sendX = sendRect.left + sendRect.width / 2;
+          const sendY = sendRect.top + sendRect.height / 2;
+          let best = null;
+          let bestScore = Infinity;
+          for (const candidate of root.querySelectorAll(
+            "button, a, [role=button], div, span",
+          )) {
+            if (
+              !isVisible(candidate) ||
+              normalize(
+                candidate.innerText || candidate.textContent,
+              ) !== text
+            ) {
+              continue;
+            }
+            const rect = candidate.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            if (
+              Math.abs(centerX - sendX) > 350 ||
+              Math.abs(centerY - sendY) > 160
+            ) {
+              continue;
+            }
+            const score =
+              Math.abs(centerX - sendX) +
+              Math.abs(centerY - sendY) * 2;
+            if (score < bestScore) {
+              best = candidate;
+              bestScore = score;
+            }
+          }
+          if (!best) {
+            return false;
+          }
+          best.click();
+          return true;
+        }
+        """,
+        {"text": text},
+    )
+    if acted is not True:
+        raise RuntimeError(
+            f"Weibo visibility trigger {text} near the current editor "
+            "could not be clicked"
+        )
 
 
 async def _wait_for_new_exact_text_action(

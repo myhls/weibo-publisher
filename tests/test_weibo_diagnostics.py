@@ -22,6 +22,7 @@ async def test_private_option_uses_newly_opened_global_portal() -> None:
         assert await page.locator("#visibility").inner_text() == "仅自己可见"
         assert await page.evaluate("window.portalOptionClicks") == 1
         assert await page.evaluate("window.decoyOptionClicks ?? 0") == 0
+        assert await page.evaluate("window.navigationClickCount ?? 0") == 0
         assert await page.evaluate("window.publishClickCount ?? 0") == 0
 
 
@@ -89,6 +90,7 @@ def _portal_html(*, open_portal: bool = False) -> str:
         <body>
           <header><a class="gn_name" href="/u/123">Account</a></header>
           <main id="composer-shell">
+            <a id="navigation-public" href="/mygroups?gid=1">公开</a>
             <textarea id="body" placeholder="分享新鲜事"></textarea>
             <button
               id="visibility"
@@ -109,6 +111,14 @@ def _portal_html(*, open_portal: bool = False) -> str:
           <script>
             const trigger = document.querySelector("#visibility");
             const portal = document.querySelector("#visibility-portal");
+            document.querySelector("#navigation-public").addEventListener(
+              "click",
+              (event) => {{
+                event.preventDefault();
+                window.navigationClickCount =
+                  (window.navigationClickCount ?? 0) + 1;
+              }}
+            );
             trigger.addEventListener("click", () => {{
               trigger.setAttribute("aria-expanded", "true");
               portal.hidden = false;

@@ -62,7 +62,7 @@ async def test_prepare_fails_before_click_without_non_page_common_ancestor(
     async with _local_page(_page_html(has_common_ancestor=False)) as page:
         with pytest.raises(
             RuntimeError,
-            match="contains both a visible publish control and a visible visibility control",
+            match="contains a visible publish control near the current editor",
         ):
             await weibo._prepare_page(
                 page,
