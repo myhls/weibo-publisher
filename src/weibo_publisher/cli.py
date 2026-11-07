@@ -20,6 +20,8 @@ from weibo_publisher.validation import (
     validate_images,
 )
 
+MINIMUM_SCHEDULE_LEAD_SECONDS = 300
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -45,7 +47,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     add = subparsers.add_parser("add", help="Create a draft post.")
-    add.add_argument("--text", required=True, help="Post body text.")
+    text_source = add.add_mutually_exclusive_group(required=True)
+    text_source.add_argument("--text", help="Post body text.")
+    text_source.add_argument(
+        "--text-file",
+        type=Path,
+        help="Read post body text from a UTF-8 file.",
+    )
     add.add_argument("--image", action="append", default=[], help="Image path.")
     add.add_argument(
         "--at",
@@ -135,9 +143,23 @@ def _cmd_add(args: argparse.Namespace) -> int:
     except ValueError as exc:
         return _fail(str(exc))
 
-    text = normalize_text(args.text)
+    try:
+        raw_text = (
+            args.text_file.expanduser().resolve().read_text(encoding="utf-8-sig")
+            if args.text_file is not None
+            else args.text
+        )
+    except (OSError, UnicodeError) as exc:
+        return _fail(f"could not read text file: {exc}")
+
+    text = normalize_text(raw_text)
     if not text:
         return _fail("text must not be empty")
+
+    minimum_lead = max(MINIMUM_SCHEDULE_LEAD_SECONDS, config.prepare_lead_seconds)
+    earliest = datetime.now(UTC) + timedelta(seconds=minimum_lead)
+    if publish_at_utc < earliest:
+        return _fail(f"publish time must be at least {minimum_lead} seconds away")
 
     resolved_images: list[Path] = []
     for image in images:

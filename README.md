@@ -59,6 +59,16 @@ python -m weibo_publisher doctor
 python -m weibo_publisher add --text "可爱" --image "D:\path\image.jpg" --at "2026-11-07T17:30:00+08:00"
 ```
 
+For Chinese text or multi-line copy, keep the post body in a UTF-8 text file and
+pass the file path instead:
+
+```powershell
+python -m weibo_publisher add --text-file "D:\path\post.txt" --image "D:\path\image.jpg" --at "2026-11-07T17:30:00+08:00"
+```
+
+New jobs must be scheduled at least five minutes in advance. This leaves enough
+time for review and the three-minute preparation window.
+
 Repeat `--image` to attach more than one image. The publish time must be an ISO
 8601 timestamp with a timezone. `add` creates a draft and does not publish it.
 

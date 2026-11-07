@@ -83,6 +83,31 @@ def test_add_creates_draft_and_confirm_approves(tmp_path: Path, monkeypatch) -> 
     assert approved.fingerprint
 
 
+def test_add_reads_utf8_text_file(tmp_path: Path, monkeypatch) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"jpeg")
+    text_file = tmp_path / "post.txt"
+    text = "#拉普兰德[超话]\n关于银白色的一切║12:25\n上一棒:@"
+    text_file.write_text(f"\ufeff{text}", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    future = datetime.now(UTC) + timedelta(hours=1)
+
+    assert main(
+        [
+            "add",
+            "--text-file",
+            str(text_file),
+            "--image",
+            str(image),
+            "--at",
+            future.isoformat(),
+        ]
+    ) == 0
+
+    draft = _only_draft(tmp_path)
+    assert draft.text == text
+
+
 def test_add_private_visibility_and_confirm_approves(
     tmp_path: Path,
     monkeypatch,
@@ -240,26 +265,68 @@ def test_confirm_rejects_time_within_prepare_lead(tmp_path: Path, monkeypatch, c
     monkeypatch.chdir(tmp_path)
     future = datetime.now(UTC) + timedelta(hours=1)
 
-    assert _add_draft(tmp_path, image, future) == 0
-    draft = _only_draft(tmp_path)
+    config = load_config(root=tmp_path)
+    ensure_runtime_dirs(config)
+    repo = JobRepository(config.db_path)
+    repo.initialize()
+    draft = Job(
+        id="too-soon-draft",
+        text="时间太近",
+        images=[image],
+        publish_at_utc=future,
+        timezone="Asia/Shanghai",
+        visibility=Visibility.PUBLIC,
+        status=JobStatus.DRAFT,
+        fingerprint="",
+        created_at=datetime.now(UTC),
+    )
+    repo.create_job(draft)
     code = main(["confirm", draft.id])
 
     assert code == 2
     assert "too soon" in capsys.readouterr().out
 
 
-def test_confirm_rejects_past_time(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_add_rejects_time_within_minimum_lead(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
     image = tmp_path / "image.jpg"
     image.write_bytes(b"jpeg")
     monkeypatch.chdir(tmp_path)
-    past = datetime.now(UTC) - timedelta(hours=1)
+    soon = datetime.now(UTC) + timedelta(seconds=299)
 
-    assert _add_draft(tmp_path, image, past) == 0
-    draft = _only_draft(tmp_path)
-    code = main(["confirm", draft.id])
+    assert _add_draft(tmp_path, image, soon) == 2
+
+    assert "at least 300 seconds away" in capsys.readouterr().out
+    assert JobRepository(load_config(root=tmp_path).db_path).list_jobs() == []
+
+
+def test_add_reports_unreadable_text_file(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"jpeg")
+    monkeypatch.chdir(tmp_path)
+    future = datetime.now(UTC) + timedelta(hours=1)
+
+    code = main(
+        [
+            "add",
+            "--text-file",
+            str(tmp_path / "missing.txt"),
+            "--image",
+            str(image),
+            "--at",
+            future.isoformat(),
+        ]
+    )
 
     assert code == 2
-    assert "too soon" in capsys.readouterr().out
+    assert "could not read text file" in capsys.readouterr().out
 
 
 def test_confirm_enforces_daily_limit(tmp_path: Path, monkeypatch, capsys) -> None:
