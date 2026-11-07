@@ -61,6 +61,7 @@ def approved_job(
     fingerprint: str | None = None,
     timezone: str = "Asia/Shanghai",
     visibility: Visibility = Visibility.PUBLIC,
+    rehearsal: bool = False,
 ) -> Job:
     target = datetime.now(UTC) + timedelta(seconds=seconds_from_now)
     return approved_job_at(
@@ -69,6 +70,7 @@ def approved_job(
         fingerprint=fingerprint,
         timezone=timezone,
         visibility=visibility,
+        rehearsal=rehearsal,
     )
 
 
@@ -79,6 +81,7 @@ def approved_job_at(
     fingerprint: str | None = None,
     timezone: str = "Asia/Shanghai",
     visibility: Visibility = Visibility.PUBLIC,
+    rehearsal: bool = False,
 ) -> Job:
     images = [image] if image is not None else []
     job = Job(
@@ -92,6 +95,7 @@ def approved_job_at(
         fingerprint="",
         created_at=datetime.now(UTC),
         confirmed_at=datetime.now(UTC),
+        rehearsal=rehearsal,
     )
     job.fingerprint = fingerprint or build_fingerprint(
         job.text,
@@ -171,6 +175,31 @@ async def test_private_job_is_prepared_and_published(
     assert stored.status is JobStatus.PUBLISHED
     assert fake.prepare_calls == 1
     assert fake.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_rehearsal_job_prepares_but_never_submits(
+    app_config: AppConfig,
+) -> None:
+    job = approved_job(
+        seconds_from_now=5,
+        visibility=Visibility.PRIVATE,
+        rehearsal=True,
+    )
+    repo = repository_with(app_config, job)
+    fake = FakePublisher()
+
+    await JobExecutor(app_config, repo, lambda: fake).execute(job.id)
+
+    stored = repo.get_job(job.id)
+    attempts = repo.list_attempts(job.id)
+    assert stored is not None
+    assert stored.status is JobStatus.REHEARSED
+    assert stored.rehearsal is True
+    assert fake.prepare_calls == 1
+    assert fake.submit_calls == 0
+    assert fake.close_calls == 1
+    assert attempts[0]["outcome"] == AttemptOutcome.REHEARSED.value
 
 
 @pytest.mark.asyncio

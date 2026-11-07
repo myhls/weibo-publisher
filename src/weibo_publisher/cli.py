@@ -59,6 +59,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Post visibility: public or private (仅自己可见).",
     )
     add.add_argument("--timezone", default=None, help="IANA timezone name.")
+    add.add_argument(
+        "--rehearsal",
+        action="store_true",
+        help="Prepare at the scheduled time without publishing.",
+    )
 
     confirm = subparsers.add_parser("confirm", help="Approve a draft for publishing.")
     confirm.add_argument("job_id")
@@ -151,6 +156,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
         status=JobStatus.DRAFT,
         fingerprint="",
         created_at=datetime.now(UTC),
+        rehearsal=args.rehearsal,
     )
     repo.create_job(job)
 
@@ -158,6 +164,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
     print(f"Text: {job.text}")
     print(f"Time: {_local_time(job)}")
     print(f"Images: {len(job.images)}")
+    print(f"Mode: {'rehearsal (prepare only)' if job.rehearsal else 'publish'}")
     print(f"Confirm with: weibo-publisher confirm {job.id}")
     return 0
 
@@ -274,6 +281,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Timezone: {job.timezone}")
     print(f"Visibility: {job.visibility.value}")
     print(f"Images: {', '.join(str(image) for image in job.images)}")
+    print(f"Rehearsal: {'yes' if job.rehearsal else 'no'}")
     print(f"Fingerprint: {job.fingerprint or '(none)'}")
     print(f"Created at: {job.created_at.isoformat()}")
     print(f"Confirmed at: {job.confirmed_at.isoformat() if job.confirmed_at else '(none)'}")

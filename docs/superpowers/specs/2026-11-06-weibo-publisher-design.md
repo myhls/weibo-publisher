@@ -139,6 +139,7 @@ Optional:
 
 - `--visibility public|private` (default: `public`; `private` maps to
   `仅自己可见`)
+- `--rehearsal` to prepare on the real scheduler path without publishing
 - `--timezone Asia/Shanghai`
 - `--file` for a JSON task description
 
@@ -170,6 +171,11 @@ Performs a safe Weibo UI rehearsal:
 - captures a screenshot
 - does not click publish
 
+Scheduled rehearsal jobs use the same preparation path and lead time as
+publishing jobs, but end in `rehearsed` instead of proceeding through
+`ready`, `publishing`, and `published`. Rehearsals do not consume daily-limit
+or minimum-gap slots.
+
 ### run
 
 Starts the long-running scheduler. It must be the only runner instance for the
@@ -189,6 +195,7 @@ Each job stores:
 - `publish_at_utc`: canonical UTC timestamp
 - `timezone`: IANA timezone name
 - `visibility`: `public` or `private`; `private` maps to Weibo `仅自己可见`
+- `rehearsal`: whether the job stops after preparation
 - `status`: state machine value
 - `fingerprint`: confirmation fingerprint
 - `created_at`
@@ -214,6 +221,7 @@ Each publish attempt stores:
 
 ```text
 draft -> approved -> preparing -> ready -> publishing -> published
+preparing -> rehearsed
 ```
 
 Exceptional transitions:
@@ -359,6 +367,9 @@ Artifacts include, as applicable:
 - page HTML snapshot
 - error text
 - Playwright trace on failure
+- full active-composer HTML
+- visible visibility-popover HTML and text
+- structured diagnostics JSON
 
 Logs are written to `runtime/logs/` and include job ID, state transition,
 timestamp, and error category. Logs must not include cookies or full page

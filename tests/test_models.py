@@ -38,3 +38,7 @@ def test_unknown_cannot_return_to_approved() -> None:
 
 def test_private_visibility_has_stable_cli_value() -> None:
     assert Visibility.PRIVATE == "private"
+
+
+def test_preparing_can_finish_as_rehearsed() -> None:
+    assert_transition_allowed(JobStatus.PREPARING, JobStatus.REHEARSED)

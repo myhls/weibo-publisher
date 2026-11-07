@@ -71,6 +71,21 @@ python -m weibo_publisher add --text "仅自己可见" --image "D:\path\image.jp
 
 Followers, friends-circle, and group visibility are not supported.
 
+### Scheduled prepare-only rehearsal
+
+Add `--rehearsal` to run the real scheduler preparation path without clicking
+the Weibo publish button:
+
+```powershell
+python -m weibo_publisher add --text "调度演练" --image "D:\path\image.jpg" --at "2026-11-07T17:30:00+08:00" --visibility private --rehearsal
+python -m weibo_publisher confirm JOB_ID
+python -m weibo_publisher run
+```
+
+The job prepares at the normal three-minute lead time, verifies content,
+images, and visibility, then ends as `rehearsed`. Rehearsal jobs do not count
+toward the daily publication limit or minimum publication gap.
+
 ## Show and confirm
 
 ```powershell
@@ -118,6 +133,15 @@ python -m weibo_publisher status JOB_ID
 
 `status` shows the job state, artifact directory, and publish attempts with
 their outcomes. `show` displays the job's content, schedule, and result URL.
+
+When preparation fails, the artifact directory also contains:
+
+- `failure.png`
+- `diagnostics.json`
+- `composer.html`
+- `visibility-popovers.json`
+
+These files remain under the Git-ignored `runtime/` directory.
 
 ## Limits and publication behavior
 

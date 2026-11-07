@@ -117,6 +117,39 @@ def test_add_private_visibility_and_confirm_approves(
     assert approved.fingerprint
 
 
+def test_add_rehearsal_creates_scheduled_prepare_only_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"jpeg")
+    monkeypatch.chdir(tmp_path)
+    future = datetime.now(UTC) + timedelta(days=1)
+
+    assert main(
+        [
+            "add",
+            "--text",
+            "调度演练",
+            "--image",
+            str(image),
+            "--at",
+            future.isoformat(),
+            "--visibility",
+            "private",
+            "--rehearsal",
+        ]
+    ) == 0
+
+    draft = _only_draft(tmp_path)
+    assert draft.rehearsal is True
+    assert main(["confirm", draft.id]) == 0
+    approved = JobRepository(load_config(root=tmp_path).db_path).get_job(draft.id)
+    assert approved is not None
+    assert approved.status is JobStatus.APPROVED
+    assert approved.rehearsal is True
+
+
 def test_add_rejects_followers_visibility_clearly(
     tmp_path: Path,
     monkeypatch,

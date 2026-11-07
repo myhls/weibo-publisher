@@ -99,6 +99,23 @@ class JobExecutor:
             publisher = self.publisher_factory()
 
             await publisher.prepare(job, artifact_dir)
+            if job.rehearsal:
+                if not self.repo.transition(
+                    job_id,
+                    {JobStatus.PREPARING},
+                    JobStatus.REHEARSED,
+                    artifact_dir=artifact_dir,
+                    last_error=None,
+                ):
+                    raise RuntimeError(
+                        "Job was not preparing after rehearsal preparation"
+                    )
+                self.repo.finish_attempt(
+                    attempt_id,
+                    AttemptOutcome.REHEARSED.value,
+                    None,
+                )
+                return
             if not self.repo.transition(
                 job_id,
                 {JobStatus.PREPARING},

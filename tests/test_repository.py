@@ -310,6 +310,72 @@ def test_confirmation_accepts_private_visibility_atomically(tmp_path: Path) -> N
     assert confirmed.fingerprint == "confirmed-fingerprint"
 
 
+def test_rehearsal_flag_round_trips_and_does_not_consume_limits(
+    tmp_path: Path,
+) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+    repo.initialize()
+    rehearsal = make_job()
+    rehearsal.rehearsal = True
+    repo.create_job(rehearsal)
+    repo.transition("job-1", {JobStatus.DRAFT}, JobStatus.APPROVED)
+
+    loaded = repo.get_job("job-1")
+    assert loaded is not None
+    assert loaded.rehearsal is True
+    assert repo.count_for_local_date(date(2026, 11, 7), "Asia/Shanghai") == 0
+    assert (
+        repo.find_gap_conflict(
+            datetime(2026, 11, 7, 9, 31, tzinfo=UTC),
+            gap_seconds=240,
+        )
+        is None
+    )
+
+
+def test_initialize_migrates_existing_database_with_rehearsal_column(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                images_json TEXT NOT NULL,
+                publish_at_utc TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                status TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                last_attempt_at TEXT,
+                published_at TEXT,
+                weibo_mid TEXT,
+                weibo_url TEXT,
+                last_error TEXT,
+                artifact_dir TEXT
+            )
+            """
+        )
+
+    repo = JobRepository(db_path)
+    repo.initialize()
+    repo.create_job(make_job())
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+    assert "rehearsal" in columns
+    loaded = repo.get_job("job-1")
+    assert loaded is not None
+    assert loaded.rehearsal is False
+
+
 def test_confirmation_is_atomic_for_daily_limit(tmp_path: Path) -> None:
     repo = JobRepository(tmp_path / "state.db")
     repo.initialize()

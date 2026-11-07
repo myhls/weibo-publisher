@@ -13,6 +13,7 @@ class JobStatus(StrEnum):
     READY = "ready"
     PUBLISHING = "publishing"
     PUBLISHED = "published"
+    REHEARSED = "rehearsed"
     NEEDS_ATTENTION = "needs_attention"
     FAILED = "failed"
     UNKNOWN = "unknown"
@@ -28,6 +29,7 @@ class Visibility(StrEnum):
 
 class AttemptOutcome(StrEnum):
     SUCCESS = "success"
+    REHEARSED = "rehearsed"
     FAILED = "failed"
     UNKNOWN = "unknown"
     INTERRUPTED = "interrupted"
@@ -51,6 +53,7 @@ class Job:
     weibo_url: str | None = None
     last_error: str | None = None
     artifact_dir: Path | None = None
+    rehearsal: bool = False
 
 
 @dataclass(slots=True)
@@ -70,6 +73,7 @@ _TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
     },
     JobStatus.PREPARING: {
         JobStatus.READY,
+        JobStatus.REHEARSED,
         JobStatus.NEEDS_ATTENTION,
         JobStatus.FAILED,
     },
@@ -82,6 +86,7 @@ _TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
     JobStatus.UNKNOWN: {JobStatus.NEEDS_ATTENTION},
     JobStatus.NEEDS_ATTENTION: set(),
     JobStatus.PUBLISHED: set(),
+    JobStatus.REHEARSED: set(),
     JobStatus.FAILED: set(),
     JobStatus.MISSED: set(),
     JobStatus.CANCELLED: set(),

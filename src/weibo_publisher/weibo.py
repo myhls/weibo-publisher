@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from weibo_publisher.browser import (
     _NAVIGATION_TIMEOUT_MS,
@@ -85,7 +88,7 @@ _VISIBILITY_TIMEOUT_SECONDS = 5.0
 _VISIBILITY_POLL_INTERVAL_SECONDS = 0.05
 
 _VISIBILITY_SNAPSHOT_SCRIPT = """
-(root, { knownLabels, selectors, triggerAction }) => {
+(root, { knownLabels, selectors, triggerAction, ownerToken }) => {
   const empty = () => ({
     label: null,
     labels: [],
@@ -203,6 +206,38 @@ _VISIBILITY_SNAPSHOT_SCRIPT = """
 
   const clicked = best !== null && triggerAction === true;
   if (clicked) {
+    if (ownerToken) {
+      best.element.setAttribute(
+        "data-codex-visibility-owner",
+        ownerToken,
+      );
+      const popupSelectors = [
+        '[role="listbox"]',
+        '[role="menu"]',
+        '[role="dialog"]',
+        '[id*="visibility-option"]',
+        '[id*="visibility-menu"]',
+        '[id*="visibility-popup"]',
+        '[id*="visibility-dropdown"]',
+        '[class*="visibility-option"]',
+        '[class*="visibility-menu"]',
+        '[class*="visibility-popup"]',
+        '[class*="visibility-dropdown"]',
+        '[class*="dropdown"]',
+        '[class*="popup"]',
+        '[class*="popover"]',
+      ];
+      for (const popup of document.querySelectorAll(
+        popupSelectors.join(","),
+      )) {
+        if (popup instanceof HTMLElement && isVisible(popup)) {
+          popup.setAttribute(
+            "data-codex-visibility-baseline",
+            ownerToken,
+          );
+        }
+      }
+    }
     best.element.click();
   }
   return {
@@ -210,6 +245,162 @@ _VISIBILITY_SNAPSHOT_SCRIPT = """
     labels,
     hasTrigger: best !== null,
     clicked,
+  };
+}
+"""
+
+_VISIBILITY_PORTAL_OPTION_SCRIPT = """
+({ ownerToken, targetLabel }) => {
+  const normalize = (value) =>
+    String(value ?? "").replace(/\\s+/g, " ").trim();
+  const isVisible = (element) => {
+    if (
+      element.hidden ||
+      element.getAttribute("aria-hidden") === "true" ||
+      element.getClientRects().length === 0
+    ) {
+      return false;
+    }
+    const style = getComputedStyle(element);
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.visibility !== "collapse" &&
+      Number(style.opacity) !== 0
+    );
+  };
+  const owner = document.querySelector(
+    `[data-codex-visibility-owner="${ownerToken}"]`,
+  );
+  if (!(owner instanceof HTMLElement) || !isVisible(owner)) {
+    return {
+      acted: false,
+      label: null,
+      detail: "current composer visibility trigger is unavailable",
+    };
+  }
+
+  const popupSelectors = [
+    '[role="listbox"]',
+    '[role="menu"]',
+    '[role="dialog"]',
+    '[id*="visibility-option"]',
+    '[id*="visibility-menu"]',
+    '[id*="visibility-popup"]',
+    '[id*="visibility-dropdown"]',
+    '[class*="visibility-option"]',
+    '[class*="visibility-menu"]',
+    '[class*="visibility-popup"]',
+    '[class*="visibility-dropdown"]',
+    '[class*="dropdown"]',
+    '[class*="popup"]',
+    '[class*="popover"]',
+  ];
+  const controlledIds = [
+    owner.getAttribute("aria-controls"),
+    owner.getAttribute("aria-owns"),
+  ].flatMap((value) => String(value ?? "").split(/\\s+/))
+    .filter(Boolean);
+  const controlledPopups = controlledIds
+    .map((id) => document.getElementById(id))
+    .filter(
+      (popup) =>
+        popup instanceof HTMLElement && isVisible(popup),
+    );
+  const newlyOpenedPopups = [];
+  for (const popup of document.querySelectorAll(
+    popupSelectors.join(","),
+  )) {
+    if (
+      popup instanceof HTMLElement &&
+      isVisible(popup) &&
+      popup.getAttribute("data-codex-visibility-baseline") !== ownerToken
+    ) {
+      newlyOpenedPopups.push(popup);
+    }
+  }
+  const popups = controlledPopups.length
+    ? controlledPopups
+    : newlyOpenedPopups;
+  if (popups.length === 0) {
+    return {
+      acted: false,
+      label: null,
+      detail: "no newly opened visibility popup was found",
+    };
+  }
+
+  const interactiveSelector =
+    'button, a, [role="button"], [role="option"], ' +
+    '[role="menuitem"], [role="menuitemradio"], [role="radio"], ' +
+    'li, [data-visibility], [tabindex]';
+  const candidates = new Set();
+  for (const popup of popups) {
+    for (const candidate of popup.querySelectorAll(interactiveSelector)) {
+      candidates.add(candidate);
+    }
+  }
+
+  const target = normalize(targetLabel);
+  let best = null;
+  let bestScore = 0;
+  for (const candidate of candidates) {
+    if (
+      !(candidate instanceof HTMLElement) ||
+      !isVisible(candidate) ||
+      candidate.matches(":disabled") ||
+      candidate.getAttribute("aria-disabled") === "true"
+    ) {
+      continue;
+    }
+    const values = [
+      candidate.innerText ?? "",
+      candidate.textContent ?? "",
+      candidate.getAttribute("aria-label") ?? "",
+      candidate.getAttribute("data-visibility") ?? "",
+    ].map(normalize);
+    if (!values.includes(target)) {
+      continue;
+    }
+    let score = 0;
+    if (candidate.matches('button, a, [role="button"]')) {
+      score += 30;
+    }
+    if (
+      candidate.matches(
+        '[role="option"], [role="menuitem"], ' +
+        '[role="menuitemradio"], [role="radio"]',
+      )
+    ) {
+      score += 50;
+    }
+    if (
+      candidate.matches(
+        '[data-visibility], [data-testid="visibility"]',
+      )
+    ) {
+      score += 20;
+    }
+    if (candidate.matches("li, [tabindex]")) {
+      score += 10;
+    }
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  if (best === null) {
+    return {
+      acted: false,
+      label: null,
+      detail: "visibility popup did not contain an interactive target",
+    };
+  }
+  best.click();
+  return {
+    acted: true,
+    label: target,
+    detail: "visibility option clicked in popup opened by current trigger",
   };
 }
 """
@@ -456,7 +647,13 @@ class WeiboPublisher:
                 visibility=job.visibility,
                 attached_images=attached_images,
             )
-        except BaseException:
+        except BaseException as exc:
+            if self.page is not None:
+                await capture_failure_diagnostics(
+                    self.page,
+                    artifact_dir,
+                    exc,
+                )
             await self.close()
             raise
 
@@ -489,6 +686,7 @@ class WeiboPublisher:
             )
             button = await first_visible(page, PUBLISH_SELECTORS)
         except Exception as exc:  # noqa: BLE001 - pre-click failures are definite
+            await capture_failure_diagnostics(page, artifact_dir, exc)
             await _screenshot_safely(
                 page,
                 artifact_dir / "submit-validation-failed.png",
@@ -545,13 +743,17 @@ async def preview_job(
 
     async with persistent_context(config) as context:
         page = context.pages[0] if context.pages else await context.new_page()
-        await _prepare_page(
-            page,
-            job.text,
-            images,
-            job.visibility,
-            artifact_dir,
-        )
+        try:
+            await _prepare_page(
+                page,
+                job.text,
+                images,
+                job.visibility,
+                artifact_dir,
+            )
+        except Exception as exc:
+            await capture_failure_diagnostics(page, artifact_dir, exc)
+            raise
 
 
 async def _prepare_page(
@@ -1161,37 +1363,66 @@ async def _ensure_visibility(
             f"current composer label is {current_label}"
         )
 
-    trigger_label = await _wait_for_visibility_action(
-        composer_region,
-        _VISIBILITY_SNAPSHOT_SCRIPT,
-        {
-            "knownLabels": sorted(_KNOWN_VISIBILITY_LABELS),
-            "selectors": _VISIBILITY_CSS_SELECTORS,
-            "triggerAction": True,
-        },
-        "visibility trigger",
-    )
-    if trigger_label.label in expected_labels:
+    page = composer_region.page
+    owner_token = uuid4().hex
+    try:
+        trigger_label = await _wait_for_visibility_action(
+            composer_region,
+            _VISIBILITY_SNAPSHOT_SCRIPT,
+            {
+                "knownLabels": sorted(_KNOWN_VISIBILITY_LABELS),
+                "selectors": _VISIBILITY_CSS_SELECTORS,
+                "triggerAction": True,
+                "ownerToken": owner_token,
+            },
+            "visibility trigger",
+        )
+        if trigger_label.label in expected_labels:
+            await _wait_for_visibility_snapshot(
+                composer_region,
+                expected_labels=expected_labels,
+            )
+            return
+
+        await _wait_for_visibility_action(
+            page,
+            _VISIBILITY_PORTAL_OPTION_SCRIPT,
+            {
+                "ownerToken": owner_token,
+                "targetLabel": target_label,
+            },
+            f"visibility option {target_label}",
+        )
         await _wait_for_visibility_snapshot(
             composer_region,
             expected_labels=expected_labels,
         )
-        return
-
-    await _wait_for_visibility_action(
-        composer_region,
-        _VISIBILITY_OPTION_SCRIPT,
-        {"targetLabel": target_label},
-        f"visibility option {target_label}",
-    )
-    await _wait_for_visibility_snapshot(
-        composer_region,
-        expected_labels=expected_labels,
-    )
+    finally:
+        with suppress(Exception):
+            await page.evaluate(
+                """
+                (token) => {
+                  document
+                    .querySelectorAll(
+                      `[data-codex-visibility-owner="${token}"], ` +
+                      `[data-codex-visibility-baseline="${token}"]`,
+                    )
+                    .forEach((element) => {
+                      element.removeAttribute(
+                        "data-codex-visibility-owner",
+                      );
+                      element.removeAttribute(
+                        "data-codex-visibility-baseline",
+                      );
+                    });
+                }
+                """,
+                owner_token,
+            )
 
 
 async def _wait_for_visibility_action(
-    composer_region: Locator,
+    context: Page | Locator,
     script: str,
     arguments: dict[str, object],
     description: str,
@@ -1204,10 +1435,9 @@ async def _wait_for_visibility_action(
         if remaining <= 0:
             break
         try:
-            raw_result = await composer_region.evaluate(
-                script,
-                arguments,
-                timeout=max(1, int(remaining * 1_000)),
+            raw_result = await asyncio.wait_for(
+                context.evaluate(script, arguments),
+                timeout=max(0.001, remaining),
             )
         except Exception as exc:  # noqa: BLE001 - retry until readiness deadline
             last_error = exc
@@ -1264,6 +1494,187 @@ def _visibility_labels_for(visibility: Visibility) -> frozenset[str]:
     if visibility is Visibility.PRIVATE:
         return frozenset({_PRIVATE_VISIBILITY_LABEL})
     raise RuntimeError("followers visibility is not supported yet")
+
+
+async def capture_failure_diagnostics(
+    page: Page,
+    artifact_dir: Path,
+    error: BaseException,
+) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    await _screenshot_safely(page, artifact_dir / "failure.png")
+    try:
+        raw = await page.evaluate(
+            """
+            ({
+              textSelectors,
+              visibilitySelectors,
+              knownLabels,
+              popupSelectors,
+            }) => {
+              const normalize = (value) =>
+                String(value ?? "").replace(/\\s+/g, " ").trim();
+              const isVisible = (element) => {
+                if (!(element instanceof HTMLElement)) {
+                  return false;
+                }
+                if (
+                  element.hidden ||
+                  element.getAttribute("aria-hidden") === "true" ||
+                  element.getClientRects().length === 0
+                ) {
+                  return false;
+                }
+                const style = getComputedStyle(element);
+                return (
+                  style.display !== "none" &&
+                  style.visibility !== "hidden" &&
+                  style.visibility !== "collapse" &&
+                  Number(style.opacity) !== 0
+                );
+              };
+              let composer = null;
+              for (const selector of textSelectors) {
+                composer = [...document.querySelectorAll(selector)]
+                  .find(isVisible) ?? null;
+                if (composer) {
+                  break;
+                }
+              }
+
+              let composerRoot = null;
+              if (composer) {
+                composerRoot = composer.parentElement;
+                while (
+                  composerRoot &&
+                  composerRoot !== document.body &&
+                  composerRoot !== document.documentElement
+                ) {
+                  const hasPublish = [...composerRoot.querySelectorAll(
+                    'button, a, [role="button"]',
+                  )].some(
+                    (candidate) =>
+                      isVisible(candidate) &&
+                      /发布|发送/.test(normalize(candidate.innerText)),
+                  );
+                  const hasVisibility = [...composerRoot.querySelectorAll(
+                    visibilitySelectors.join(","),
+                  )].some(
+                    (candidate) =>
+                      isVisible(candidate) &&
+                      knownLabels.includes(normalize(candidate.innerText)),
+                  );
+                  if (hasPublish && hasVisibility) {
+                    break;
+                  }
+                  composerRoot = composerRoot.parentElement;
+                }
+                if (
+                  !composerRoot ||
+                  composerRoot === document.body ||
+                  composerRoot === document.documentElement
+                ) {
+                  composerRoot = composer.parentElement;
+                }
+              }
+
+              const popovers = [];
+              for (const popup of document.querySelectorAll(
+                popupSelectors.join(","),
+              )) {
+                if (!isVisible(popup)) {
+                  continue;
+                }
+                popovers.push({
+                  tag: popup.tagName.toLowerCase(),
+                  role: popup.getAttribute("role"),
+                  id: popup.id || null,
+                  className:
+                    typeof popup.className === "string"
+                      ? popup.className
+                      : null,
+                  text: normalize(popup.innerText).slice(0, 4000),
+                  html: popup.outerHTML,
+                });
+              }
+              const visibilityLabels = [];
+              if (composerRoot) {
+                for (const candidate of composerRoot.querySelectorAll(
+                  visibilitySelectors.join(","),
+                )) {
+                  if (!isVisible(candidate)) {
+                    continue;
+                  }
+                  const label = normalize(candidate.innerText);
+                  if (knownLabels.includes(label) && !visibilityLabels.includes(label)) {
+                    visibilityLabels.push(label);
+                  }
+                }
+              }
+              return {
+                url: location.href,
+                title: document.title,
+                composer_found: composer !== null,
+                composer_root_found: composerRoot !== null,
+                composer_text: composer ? normalize(composer.value ?? composer.innerText) : null,
+                composer_html: composerRoot ? composerRoot.outerHTML : null,
+                visibility_labels: visibilityLabels,
+                popovers,
+                active_element_html:
+                  document.activeElement instanceof HTMLElement
+                    ? document.activeElement.outerHTML
+                    : null,
+              };
+            }
+            """,
+            {
+                "textSelectors": TEXT_SELECTORS,
+                "visibilitySelectors": _VISIBILITY_CSS_SELECTORS,
+                "knownLabels": sorted(_KNOWN_VISIBILITY_LABELS),
+                "popupSelectors": [
+                    '[role="listbox"]',
+                    '[role="menu"]',
+                    '[role="dialog"]',
+                    '[id*="visibility-option"]',
+                    '[id*="visibility-menu"]',
+                    '[id*="visibility-popup"]',
+                    '[id*="visibility-dropdown"]',
+                    '[class*="visibility-option"]',
+                    '[class*="visibility-menu"]',
+                    '[class*="visibility-popup"]',
+                    '[class*="visibility-dropdown"]',
+                    '[class*="dropdown"]',
+                    '[class*="popup"]',
+                    '[class*="popover"]',
+                ],
+            },
+        )
+    except Exception as diagnostics_error:  # noqa: BLE001 - diagnostics are best effort
+        raw = {"diagnostics_error": str(diagnostics_error)}
+
+    if not isinstance(raw, dict):
+        raw = {}
+    composer_html = raw.pop("composer_html", None)
+    popovers = raw.pop("popovers", [])
+    diagnostics = {
+        "captured_at": datetime.now(UTC).isoformat(),
+        "error_type": type(error).__name__,
+        "error": str(error),
+        **raw,
+        "popover_count": len(popovers) if isinstance(popovers, list) else 0,
+    }
+    (artifact_dir / "diagnostics.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "visibility-popovers.json").write_text(
+        json.dumps(popovers, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "composer.html").write_text(
+        composer_html if isinstance(composer_html, str) else "",
+        encoding="utf-8",
+    )
 
 
 async def _screenshot_safely(page: Page, path: Path) -> None:

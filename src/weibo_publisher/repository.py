@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     weibo_mid TEXT,
     weibo_url TEXT,
     last_error TEXT,
-    artifact_dir TEXT
+    artifact_dir TEXT,
+    rehearsal INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -77,6 +78,17 @@ class JobRepository:
     def initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(jobs)"
+                ).fetchall()
+            }
+            if "rehearsal" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN "
+                    "rehearsal INTEGER NOT NULL DEFAULT 0"
+                )
 
     def create_job(self, job: Job) -> None:
         with self._connect() as connection:
@@ -98,8 +110,9 @@ class JobRepository:
                     weibo_mid,
                     weibo_url,
                     last_error,
-                    artifact_dir
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    artifact_dir,
+                    rehearsal
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -118,6 +131,7 @@ class JobRepository:
                     job.weibo_url,
                     job.last_error,
                     str(job.artifact_dir) if job.artifact_dir else None,
+                    int(job.rehearsal),
                 ),
             )
 
@@ -224,6 +238,7 @@ class JobRepository:
             SELECT COUNT(*)
             FROM jobs
             WHERE status IN ({placeholders})
+              AND rehearsal = 0
               AND publish_at_utc >= ?
               AND publish_at_utc < ?
               {exclusion}
@@ -258,6 +273,7 @@ class JobRepository:
             SELECT *
             FROM jobs
             WHERE status IN ({placeholders})
+              AND rehearsal = 0
               AND publish_at_utc BETWEEN ? AND ?
             ORDER BY publish_at_utc
             LIMIT 1
@@ -449,4 +465,5 @@ class JobRepository:
             weibo_url=row["weibo_url"],
             last_error=row["last_error"],
             artifact_dir=Path(row["artifact_dir"]) if row["artifact_dir"] else None,
+            rehearsal=bool(row["rehearsal"]),
         )
