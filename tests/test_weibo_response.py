@@ -588,7 +588,7 @@ async def test_submit_ignores_private_label_decoys_outside_composer(
 
 
 @pytest.mark.asyncio
-async def test_prepare_selects_and_verifies_private_visibility_after_content(
+async def test_prepare_selects_private_visibility_before_image_upload(
     app_config: AppConfig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -609,8 +609,11 @@ async def test_prepare_selects_and_verifies_private_visibility_after_content(
     try:
         assert publisher.page is not None
         current_label = await publisher.page.locator("#visibility").inner_text()
-        prepared_before_opening = await publisher.page.evaluate(
-            "window.visibilityOpenedWithPreparedContent"
+        visibility_opened_before_images = await publisher.page.evaluate(
+            "window.visibilityOpenedBeforeImages"
+        )
+        image_file_count = await publisher.page.evaluate(
+            "document.querySelector('#image').files.length"
         )
         click_count = await publisher.page.evaluate(
             "window.publishClickCount ?? 0"
@@ -619,7 +622,8 @@ async def test_prepare_selects_and_verifies_private_visibility_after_content(
         await publisher.close()
 
     assert current_label == "仅自己可见"
-    assert prepared_before_opening is True
+    assert visibility_opened_before_images is True
+    assert image_file_count == 1
     assert click_count == 0
     assert (artifact_dir / "preview.png").is_file()
 
@@ -647,8 +651,11 @@ async def test_prepare_selects_public_when_composer_initially_shows_private(
     try:
         assert publisher.page is not None
         current_label = await publisher.page.locator("#visibility").inner_text()
-        prepared_before_opening = await publisher.page.evaluate(
-            "window.visibilityOpenedWithPreparedContent"
+        visibility_opened_before_images = await publisher.page.evaluate(
+            "window.visibilityOpenedBeforeImages"
+        )
+        image_file_count = await publisher.page.evaluate(
+            "document.querySelector('#image').files.length"
         )
         click_count = await publisher.page.evaluate(
             "window.publishClickCount ?? 0"
@@ -657,7 +664,8 @@ async def test_prepare_selects_public_when_composer_initially_shows_private(
         await publisher.close()
 
     assert current_label == "公开"
-    assert prepared_before_opening is True
+    assert visibility_opened_before_images is True
+    assert image_file_count == 1
     assert click_count == 0
     assert (artifact_dir / "preview.png").is_file()
 
@@ -821,9 +829,9 @@ def _page_html(*, sends_post: bool, initial_visibility: str = "公开") -> str:
           const visibility = document.querySelector("#visibility");
           const visibilityOptions = document.querySelector("#visibility-options");
           visibility.addEventListener("click", () => {{
-            window.visibilityOpenedWithPreparedContent =
+            window.visibilityOpenedBeforeImages =
               document.querySelector("#body").value.length > 0 &&
-              document.querySelector("#image").files.length > 0;
+              document.querySelector("#image").files.length === 0;
             visibilityOptions.hidden = false;
           }});
           for (const option of visibilityOptions.querySelectorAll("button")) {{

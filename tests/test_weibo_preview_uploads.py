@@ -158,6 +158,11 @@ async def test_prepare_page_does_not_save_preview_after_image_timeout(
                 <header><a class="gn_name" href="/u/123">Account</a></header>
                 <main>
                   <textarea placeholder="分享新鲜事"></textarea>
+                  <button id="visibility" type="button">公开</button>
+                  <div id="visibility-options" hidden>
+                    <button type="button">公开</button>
+                    <button type="button">仅自己可见</button>
+                  </div>
                   <input type="file" accept="image/*">
                   <img
                     class="woo-picture-img"
@@ -165,6 +170,21 @@ async def test_prepare_page_does_not_save_preview_after_image_timeout(
                   >
                   <button type="button">发布</button>
                 </main>
+                <script>
+                  const visibility =
+                    document.querySelector("#visibility");
+                  const options =
+                    document.querySelector("#visibility-options");
+                  visibility.addEventListener("click", () => {
+                    options.hidden = false;
+                  });
+                  for (const option of options.querySelectorAll("button")) {
+                    option.addEventListener("click", () => {
+                      visibility.textContent = option.textContent;
+                      options.hidden = true;
+                    });
+                  }
+                </script>
                 """
             ),
         )

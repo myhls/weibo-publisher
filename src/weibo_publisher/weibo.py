@@ -835,15 +835,15 @@ async def _prepare_page(
     else:
         raise RuntimeError("Matched Weibo control is not an editable composer")
 
+    if composer_region is None:
+        composer_region = await _active_composer_region(composer)
+    await _ensure_visibility(composer_region, visibility)
+
     if images:
         image_input = await _first_present(page, IMAGE_INPUT_SELECTORS)
         await image_input.set_input_files([str(image) for image in images])
         await _wait_for_uploads(page)
         await _wait_for_uploaded_image_previews(page, len(images))
-
-    if composer_region is None:
-        composer_region = await _active_composer_region(composer)
-    await _ensure_visibility(composer_region, visibility)
 
     await page.screenshot(
         path=str(artifact_dir / "preview.png"),

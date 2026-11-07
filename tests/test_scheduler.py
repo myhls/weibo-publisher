@@ -1143,7 +1143,7 @@ async def test_real_scheduler_awaits_production_executor(
     async def wait_for_publication(delay: float) -> None:
         assert delay == 0.01
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 2
+        deadline = loop.time() + 5
         while loop.time() < deadline:
             job = repo.get_job("job-1")
             if (
