@@ -1252,9 +1252,7 @@ async def _validate_submit_page(
 
     attached_images = await _read_attached_image_identities(page)
     expected_images = len(job.images)
-    if len(attached_images) != expected_images and (
-        attached_images or not prepared_images
-    ):
+    if attached_images and len(attached_images) != expected_images:
         raise RuntimeError(
             f"expected {expected_images} attached image(s), "
             f"found {len(attached_images)}"
