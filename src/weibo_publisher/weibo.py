@@ -653,6 +653,7 @@ class _PreparedComposerState:
     image_paths: tuple[str, ...]
     visibility: Visibility
     attached_images: tuple[_AttachedImageIdentity, ...]
+    preview_urls: tuple[str, ...]
 
 
 class WeiboPublisher:
@@ -685,9 +686,15 @@ class WeiboPublisher:
                 artifact_dir,
             )
             attached_images = await _read_attached_image_identities(self.page)
-            if len(attached_images) != len(images):
+            preview_urls = await _read_composer_preview_urls(self.page)
+            if len(preview_urls) != len(images):
                 raise RuntimeError(
-                    f"expected {len(images)} attached image(s), "
+                    f"expected {len(images)} uploaded image preview(s), "
+                    f"found {len(preview_urls)} after preparation"
+                )
+            if attached_images and len(attached_images) != len(images):
+                raise RuntimeError(
+                    f"expected {len(images)} attached browser file(s), "
                     f"found {len(attached_images)} after preparation"
                 )
             self._prepared_state = _PreparedComposerState(
@@ -695,6 +702,7 @@ class WeiboPublisher:
                 image_paths=tuple(str(image) for image in images),
                 visibility=job.visibility,
                 attached_images=attached_images,
+                preview_urls=preview_urls,
             )
         except BaseException as exc:
             if self.page is not None:
@@ -731,6 +739,7 @@ class WeiboPublisher:
                 page,
                 job,
                 prepared_state.attached_images,
+                prepared_state.preview_urls,
                 job.visibility,
             )
             button = await first_visible(page, PUBLISH_SELECTORS)
@@ -1192,10 +1201,48 @@ async def _count_loaded_composer_previews(composer: Locator) -> int:
     return raw_count
 
 
+async def _read_composer_preview_urls(page: Page) -> tuple[str, ...]:
+    composer = await first_visible(page, TEXT_SELECTORS)
+    composer_region = await _active_composer_region(composer)
+    raw_urls = await composer_region.evaluate(
+        """
+        (root) => {
+          const urls = [];
+          for (const image of root.querySelectorAll(
+            'img[class*="woo-picture-img"]',
+          )) {
+            if (image.complete !== true || image.naturalWidth <= 0) {
+              continue;
+            }
+            let url;
+            try {
+              url = new URL(image.src, document.baseURI);
+            } catch {
+              continue;
+            }
+            if (
+              url.protocol === "https:" &&
+              /^wx[^.]*\\.sinaimg\\.cn$/i.test(url.hostname)
+            ) {
+              urls.push(url.href);
+            }
+          }
+          return urls;
+        }
+        """
+    )
+    if not isinstance(raw_urls, list) or any(
+        not isinstance(url, str) for url in raw_urls
+    ):
+        raise RuntimeError("composer preview URLs returned invalid data")
+    return tuple(raw_urls)
+
+
 async def _validate_submit_page(
     page: Page,
     job: Job,
     prepared_images: tuple[_AttachedImageIdentity, ...],
+    prepared_preview_urls: tuple[str, ...],
     visibility: Visibility,
 ) -> None:
     composer = await first_visible(page, TEXT_SELECTORS)
@@ -1205,14 +1252,24 @@ async def _validate_submit_page(
 
     attached_images = await _read_attached_image_identities(page)
     expected_images = len(job.images)
-    if len(attached_images) != expected_images:
+    if len(attached_images) != expected_images and (
+        attached_images or not prepared_images
+    ):
         raise RuntimeError(
             f"expected {expected_images} attached image(s), "
             f"found {len(attached_images)}"
         )
-    if attached_images != prepared_images:
+    if prepared_images and attached_images and attached_images != prepared_images:
         raise RuntimeError(
             "attached image content or metadata does not match the prepared job"
+        )
+    preview_urls = await _read_composer_preview_urls(page)
+    if (
+        len(preview_urls) != expected_images
+        or preview_urls != prepared_preview_urls
+    ):
+        raise RuntimeError(
+            "uploaded image previews do not match the prepared job"
         )
 
     if await _has_visible_indicator(page):

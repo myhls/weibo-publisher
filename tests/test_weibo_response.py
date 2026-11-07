@@ -341,6 +341,9 @@ async def test_submit_missing_image_attachment_fails_before_click(
     try:
         assert publisher.page is not None
         await publisher.page.set_input_files("#image", [])
+        await publisher.page.evaluate(
+            "document.querySelector('img[class*=\"woo-picture-img\"]').remove()"
+        )
         result = await publisher.submit(job, artifact_dir)
         click_count = await publisher.page.evaluate(
             "window.publishClickCount ?? 0"
@@ -349,7 +352,7 @@ async def test_submit_missing_image_attachment_fails_before_click(
         await publisher.close()
 
     assert result.outcome is AttemptOutcome.FAILED
-    assert result.error is not None and "attached image" in result.error
+    assert result.error is not None and "image" in result.error.lower()
     assert click_count == 0
     assert observed["post_requests"] == 0
 
@@ -701,6 +704,87 @@ async def test_submit_revalidates_image_and_visibility_before_one_click(
     assert result.weibo_mid == "456"
     assert click_count == 1
     assert observed["post_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_accepts_cleared_file_input_using_preview_identity(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\ncleared")
+    job = _job(images=[image])
+    artifact_dir = app_config.artifacts_dir / "job-cleared-input"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"ok": 1, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.evaluate(
+            "document.querySelector('#image').value = ''"
+        )
+        result = await publisher.submit(job, artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.SUCCESS
+    assert click_count == 1
+    assert observed["post_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_same_count_preview_url_replacement(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+    job = _job(images=[image])
+    artifact_dir = app_config.artifacts_dir / "job-preview-replaced"
+    publisher, observed = await _prepared_publisher(
+        app_config,
+        monkeypatch,
+        response_payload={"ok": 1, "data": {"idstr": "123"}},
+        artifact_dir=artifact_dir,
+        job=job,
+    )
+
+    try:
+        assert publisher.page is not None
+        await publisher.page.evaluate(
+            """
+            async () => {
+              document.querySelector("#image").value = "";
+              const image = document.querySelector(
+                'img[class*="woo-picture-img"]',
+              );
+              image.src =
+                "https://wx2.sinaimg.cn/large/replacement.png";
+              await image.decode();
+            }
+            """
+        )
+        result = await publisher.submit(job, artifact_dir)
+        click_count = await publisher.page.evaluate(
+            "window.publishClickCount ?? 0"
+        )
+    finally:
+        await publisher.close()
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert "preview" in (result.error or "").lower()
+    assert click_count == 0
+    assert observed["post_requests"] == 0
 
 
 async def _submit_with_response(
