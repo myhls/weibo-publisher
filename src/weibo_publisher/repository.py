@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import sqlite3
 from collections.abc import Iterator
@@ -8,7 +9,13 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from weibo_publisher.models import Job, JobStatus, Visibility
+from weibo_publisher.models import (
+    Batch,
+    BatchStatus,
+    Job,
+    JobStatus,
+    Visibility,
+)
 
 ACTIVE_STATUSES = {
     JobStatus.APPROVED,
@@ -25,6 +32,19 @@ class ConfirmationError(ValueError):
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS batches (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    local_date TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    approved_at TEXT,
+    last_error TEXT
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     text TEXT NOT NULL,
@@ -42,7 +62,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     weibo_url TEXT,
     last_error TEXT,
     artifact_dir TEXT,
-    rehearsal INTEGER NOT NULL DEFAULT 0
+    rehearsal INTEGER NOT NULL DEFAULT 0,
+    batch_id TEXT REFERENCES batches(id),
+    source_row INTEGER,
+    source_sequence TEXT,
+    source_fingerprint TEXT
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -89,51 +113,80 @@ class JobRepository:
                     "ALTER TABLE jobs ADD COLUMN "
                     "rehearsal INTEGER NOT NULL DEFAULT 0"
                 )
+            for column_name, definition in (
+                ("batch_id", "TEXT"),
+                ("source_row", "INTEGER"),
+                ("source_sequence", "TEXT"),
+                ("source_fingerprint", "TEXT"),
+            ):
+                if column_name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE jobs ADD COLUMN "
+                        f"{column_name} {definition}"
+                    )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_batch_id ON jobs(batch_id)"
+            )
 
     def create_job(self, job: Job) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO jobs (
-                    id,
-                    text,
-                    images_json,
-                    publish_at_utc,
-                    timezone,
-                    visibility,
-                    status,
-                    fingerprint,
-                    created_at,
-                    confirmed_at,
-                    last_attempt_at,
-                    published_at,
-                    weibo_mid,
-                    weibo_url,
-                    last_error,
-                    artifact_dir,
-                    rehearsal
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job.id,
-                    job.text,
-                    json.dumps([str(image) for image in job.images]),
-                    self._to_iso(job.publish_at_utc),
-                    job.timezone,
-                    job.visibility.value,
-                    job.status.value,
-                    job.fingerprint,
-                    self._to_iso(job.created_at),
-                    self._to_iso(job.confirmed_at),
-                    self._to_iso(job.last_attempt_at),
-                    self._to_iso(job.published_at),
-                    job.weibo_mid,
-                    job.weibo_url,
-                    job.last_error,
-                    str(job.artifact_dir) if job.artifact_dir else None,
-                    int(job.rehearsal),
-                ),
-            )
+            self._insert_job(connection, job)
+
+    def _insert_job(
+        self,
+        connection: sqlite3.Connection,
+        job: Job,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                id,
+                text,
+                images_json,
+                publish_at_utc,
+                timezone,
+                visibility,
+                status,
+                fingerprint,
+                created_at,
+                confirmed_at,
+                last_attempt_at,
+                published_at,
+                weibo_mid,
+                weibo_url,
+                last_error,
+                artifact_dir,
+                rehearsal,
+                batch_id,
+                source_row,
+                source_sequence,
+                source_fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job.id,
+                job.text,
+                json.dumps([str(image) for image in job.images]),
+                self._to_iso(job.publish_at_utc),
+                job.timezone,
+                job.visibility.value,
+                job.status.value,
+                job.fingerprint,
+                self._to_iso(job.created_at),
+                self._to_iso(job.confirmed_at),
+                self._to_iso(job.last_attempt_at),
+                self._to_iso(job.published_at),
+                job.weibo_mid,
+                job.weibo_url,
+                job.last_error,
+                str(job.artifact_dir) if job.artifact_dir else None,
+                int(job.rehearsal),
+                job.batch_id,
+                job.source_row,
+                job.source_sequence,
+                job.source_fingerprint,
+            ),
+        )
 
     def get_job(self, job_id: str) -> Job | None:
         with self._connect() as connection:
@@ -155,6 +208,470 @@ class JobRepository:
                     (status.value,),
                 ).fetchall()
         return [self._row_to_job(row) for row in rows]
+
+    def create_batch(self, batch: Batch, jobs: list[Job]) -> None:
+        if not jobs:
+            raise ConfirmationError("batch must contain at least one job")
+        if any(job.batch_id != batch.id for job in jobs):
+            raise ConfirmationError("every batch job must reference the batch")
+        if any(job.status is not JobStatus.DRAFT for job in jobs):
+            raise ConfirmationError("new batch jobs must be drafts")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._insert_batch(connection, batch)
+            for job in jobs:
+                self._insert_job(connection, job)
+
+    def replace_draft_batch(
+        self,
+        batch: Batch,
+        jobs: list[Job],
+    ) -> None:
+        if not jobs:
+            raise ConfirmationError("batch must contain at least one job")
+        if any(job.batch_id != batch.id for job in jobs):
+            raise ConfirmationError("every batch job must reference the batch")
+        if any(job.status is not JobStatus.DRAFT for job in jobs):
+            raise ConfirmationError("replacement batch jobs must be drafts")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch.id,),
+            ).fetchone()
+            if existing is None:
+                raise ConfirmationError(f"batch not found: {batch.id}")
+            if BatchStatus(existing["status"]) is not BatchStatus.DRAFT:
+                raise ConfirmationError(
+                    f"batch is not a draft: {existing['status']}"
+                )
+            non_drafts = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM jobs
+                WHERE batch_id = ? AND status != ?
+                """,
+                (batch.id, JobStatus.DRAFT.value),
+            ).fetchone()[0]
+            if non_drafts:
+                raise ConfirmationError(
+                    "batch has jobs that are no longer drafts"
+                )
+            connection.execute(
+                """
+                DELETE FROM attempts
+                WHERE job_id IN (
+                    SELECT id FROM jobs WHERE batch_id = ?
+                )
+                """,
+                (batch.id,),
+            )
+            connection.execute(
+                "DELETE FROM jobs WHERE batch_id = ?",
+                (batch.id,),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE batches
+                SET name = ?,
+                    source_path = ?,
+                    source_fingerprint = ?,
+                    local_date = ?,
+                    timezone = ?,
+                    status = ?,
+                    created_at = ?,
+                    approved_at = NULL,
+                    last_error = NULL
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    batch.name,
+                    str(batch.source_path),
+                    batch.source_fingerprint,
+                    batch.local_date.isoformat(),
+                    batch.timezone,
+                    batch.status.value,
+                    self._to_iso(batch.created_at),
+                    batch.id,
+                    BatchStatus.DRAFT.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConfirmationError("batch changed while replacing")
+            for job in jobs:
+                self._insert_job(connection, job)
+
+    def get_batch(self, batch_id: str) -> Batch | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        return self._row_to_batch(row) if row else None
+
+    def list_batches(
+        self,
+        status: BatchStatus | None = None,
+    ) -> list[Batch]:
+        with self._connect() as connection:
+            if status is None:
+                rows = connection.execute(
+                    "SELECT * FROM batches ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM batches
+                    WHERE status = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (status.value,),
+                ).fetchall()
+        return [self._row_to_batch(row) for row in rows]
+
+    def list_batch_jobs(self, batch_id: str) -> list[Job]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM jobs
+                WHERE batch_id = ?
+                ORDER BY source_row, publish_at_utc
+                """,
+                (batch_id,),
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
+    def find_draft_batch_for_source(
+        self,
+        source_path: Path,
+    ) -> Batch | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM batches
+                WHERE source_path = ? AND status = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(source_path.expanduser().resolve()), BatchStatus.DRAFT.value),
+            ).fetchone()
+        return self._row_to_batch(row) if row else None
+
+    def batch_is_runnable(self, batch_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        return bool(
+            row is not None
+            and BatchStatus(row["status"]) is BatchStatus.APPROVED
+        )
+
+    def pause_batch(self, batch_id: str, error: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE batches
+                SET status = ?, last_error = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    BatchStatus.PAUSED.value,
+                    error,
+                    batch_id,
+                    BatchStatus.APPROVED.value,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def resume_batch(self, batch_id: str) -> Batch:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                raise ConfirmationError(f"batch not found: {batch_id}")
+            batch = self._row_to_batch(row)
+            if batch.status is not BatchStatus.PAUSED:
+                raise ConfirmationError(
+                    f"batch is not paused: {batch.status}"
+                )
+            active = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM jobs
+                WHERE batch_id = ?
+                  AND status IN (?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    JobStatus.PREPARING.value,
+                    JobStatus.READY.value,
+                    JobStatus.PUBLISHING.value,
+                ),
+            ).fetchone()[0]
+            if active:
+                raise ConfirmationError(
+                    "batch has a job still in an active publish state"
+                )
+            cursor = connection.execute(
+                """
+                UPDATE batches
+                SET status = ?, last_error = NULL
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    BatchStatus.APPROVED.value,
+                    batch_id,
+                    BatchStatus.PAUSED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConfirmationError("batch changed while resuming")
+            resumed = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if resumed is None:
+                raise ConfirmationError("batch disappeared while resuming")
+            return self._row_to_batch(resumed)
+
+    def cancel_batch(self, batch_id: str) -> Batch:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                raise ConfirmationError(f"batch not found: {batch_id}")
+            batch = self._row_to_batch(row)
+            if batch.status is BatchStatus.CANCELLED:
+                return batch
+            blocked_statuses = {
+                JobStatus.PREPARING,
+                JobStatus.READY,
+                JobStatus.PUBLISHING,
+                JobStatus.PUBLISHED,
+            }
+            placeholders = ",".join("?" for _ in blocked_statuses)
+            blocked = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM jobs
+                WHERE batch_id = ? AND status IN ({placeholders})
+                """,
+                (batch_id, *(status.value for status in blocked_statuses)),
+            ).fetchone()[0]
+            if blocked:
+                raise ConfirmationError(
+                    "batch cannot be cancelled after preparation or publication"
+                )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?
+                WHERE batch_id = ? AND status IN (?, ?)
+                """,
+                (
+                    JobStatus.CANCELLED.value,
+                    batch_id,
+                    JobStatus.DRAFT.value,
+                    JobStatus.APPROVED.value,
+                ),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE batches
+                SET status = ?, last_error = NULL
+                WHERE id = ? AND status IN (?, ?, ?)
+                """,
+                (
+                    BatchStatus.CANCELLED.value,
+                    batch_id,
+                    BatchStatus.DRAFT.value,
+                    BatchStatus.APPROVED.value,
+                    BatchStatus.PAUSED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConfirmationError(
+                    f"batch cannot be cancelled from {batch.status.value}"
+                )
+            cancelled = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if cancelled is None:
+                raise ConfirmationError("batch disappeared while cancelling")
+            return self._row_to_batch(cancelled)
+
+    def complete_batch_if_terminal(self, batch_id: str) -> bool:
+        active_statuses = {
+            JobStatus.APPROVED,
+            JobStatus.PREPARING,
+            JobStatus.READY,
+            JobStatus.PUBLISHING,
+        }
+        placeholders = ",".join("?" for _ in active_statuses)
+        with self._connect() as connection:
+            active = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM jobs
+                WHERE batch_id = ? AND status IN ({placeholders})
+                """,
+                (batch_id, *(status.value for status in active_statuses)),
+            ).fetchone()[0]
+            if active:
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE batches
+                SET status = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    BatchStatus.COMPLETED.value,
+                    batch_id,
+                    BatchStatus.APPROVED.value,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def confirm_batch(
+        self,
+        batch_id: str,
+        fingerprints: dict[str, str],
+        confirmed_at: datetime,
+        *,
+        daily_limit: int,
+        minimum_gap_seconds: int,
+        allow_over_limit: bool,
+    ) -> list[Job]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            batch_row = connection.execute(
+                "SELECT * FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch_row is None:
+                raise ConfirmationError(f"batch not found: {batch_id}")
+            batch = self._row_to_batch(batch_row)
+            if batch.status is not BatchStatus.DRAFT:
+                raise ConfirmationError(
+                    f"batch is not a draft: {batch.status}"
+                )
+            job_rows = connection.execute(
+                "SELECT * FROM jobs WHERE batch_id = ? ORDER BY source_row",
+                (batch_id,),
+            ).fetchall()
+            jobs = [self._row_to_job(row) for row in job_rows]
+            if not jobs:
+                raise ConfirmationError("batch has no jobs")
+            if any(job.status is not JobStatus.DRAFT for job in jobs):
+                raise ConfirmationError("all batch jobs must be drafts")
+            if any(job.batch_id != batch_id for job in jobs):
+                raise ConfirmationError("batch job reference mismatch")
+            if any(not fingerprints.get(job.id) for job in jobs):
+                raise ConfirmationError(
+                    "every batch job must have a confirmation fingerprint"
+                )
+            if any(
+                job.visibility not in {
+                    Visibility.PUBLIC,
+                    Visibility.PRIVATE,
+                }
+                for job in jobs
+            ):
+                raise ConfirmationError(
+                    "followers visibility is not supported yet"
+                )
+
+            if not allow_over_limit:
+                local_date = batch.local_date
+                count = self._count_for_local_date(
+                    connection,
+                    local_date,
+                    batch.timezone,
+                )
+                if count + len(jobs) > daily_limit:
+                    raise ConfirmationError("daily limit reached")
+
+            ordered = sorted(jobs, key=lambda job: job.publish_at_utc)
+            for previous, current in itertools.pairwise(ordered):
+                gap = (
+                    current.publish_at_utc - previous.publish_at_utc
+                ).total_seconds()
+                if gap <= 0:
+                    raise ConfirmationError(
+                        "batch publish times must be unique and ordered"
+                    )
+                if gap < minimum_gap_seconds:
+                    raise ConfirmationError(
+                        f"publish time conflicts within minimum gap: "
+                        f"{previous.id} -> {current.id}"
+                    )
+
+            for job in jobs:
+                conflict = self._find_gap_conflict(
+                    connection,
+                    job.publish_at_utc,
+                    minimum_gap_seconds,
+                )
+                if conflict is not None and conflict.batch_id != batch_id:
+                    raise ConfirmationError(
+                        f"publish time conflicts with job {conflict.id} "
+                        "within minimum gap"
+                    )
+
+            for job in jobs:
+                cursor = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?,
+                        fingerprint = ?,
+                        confirmed_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        JobStatus.APPROVED.value,
+                        fingerprints[job.id],
+                        self._to_iso(confirmed_at),
+                        job.id,
+                        JobStatus.DRAFT.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ConfirmationError(
+                        "job state changed while confirming batch"
+                    )
+            cursor = connection.execute(
+                """
+                UPDATE batches
+                SET status = ?, approved_at = ?, last_error = NULL
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    BatchStatus.APPROVED.value,
+                    self._to_iso(confirmed_at),
+                    batch_id,
+                    BatchStatus.DRAFT.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConfirmationError("batch changed while confirming")
+            confirmed_rows = connection.execute(
+                "SELECT * FROM jobs WHERE batch_id = ? ORDER BY publish_at_utc",
+                (batch_id,),
+            ).fetchall()
+            return [self._row_to_job(row) for row in confirmed_rows]
 
     def _sql_value(self, value: object) -> object:
         if isinstance(value, datetime):
@@ -274,7 +791,8 @@ class JobRepository:
             FROM jobs
             WHERE status IN ({placeholders})
               AND rehearsal = 0
-              AND publish_at_utc BETWEEN ? AND ?
+              AND publish_at_utc > ?
+              AND publish_at_utc < ?
             ORDER BY publish_at_utc
             LIMIT 1
             """,
@@ -434,6 +952,54 @@ class JobRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def _insert_batch(
+        self,
+        connection: sqlite3.Connection,
+        batch: Batch,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO batches (
+                id,
+                name,
+                source_path,
+                source_fingerprint,
+                local_date,
+                timezone,
+                status,
+                created_at,
+                approved_at,
+                last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch.id,
+                batch.name,
+                str(batch.source_path),
+                batch.source_fingerprint,
+                batch.local_date.isoformat(),
+                batch.timezone,
+                batch.status.value,
+                self._to_iso(batch.created_at),
+                self._to_iso(batch.approved_at),
+                batch.last_error,
+            ),
+        )
+
+    def _row_to_batch(self, row: sqlite3.Row) -> Batch:
+        return Batch(
+            id=row["id"],
+            name=row["name"],
+            source_path=Path(row["source_path"]),
+            source_fingerprint=row["source_fingerprint"],
+            local_date=date.fromisoformat(row["local_date"]),
+            timezone=row["timezone"],
+            status=BatchStatus(row["status"]),
+            created_at=self._parse_iso(row["created_at"]),
+            approved_at=self._parse_iso(row["approved_at"]),
+            last_error=row["last_error"],
+        )
+
     def _to_iso(self, value: datetime | None) -> str | None:
         if value is None:
             return None
@@ -466,4 +1032,8 @@ class JobRepository:
             last_error=row["last_error"],
             artifact_dir=Path(row["artifact_dir"]) if row["artifact_dir"] else None,
             rehearsal=bool(row["rehearsal"]),
+            batch_id=row["batch_id"],
+            source_row=row["source_row"],
+            source_sequence=row["source_sequence"],
+            source_fingerprint=row["source_fingerprint"],
         )

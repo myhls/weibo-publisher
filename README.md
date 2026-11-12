@@ -108,6 +108,74 @@ publishing requires explicit task confirmation; only approved jobs are
 scheduled. Confirmation also requires enough time for the three-minute
 preparation window.
 
+## Batch workbook
+
+Import the workbook into draft jobs first:
+
+```powershell
+python -m weibo_publisher batch-import `
+  --file "D:\path\weibo-batch.xlsx" `
+  --date 2026-11-11
+```
+
+The command reads the `发布清单` sheet, validates every row, and creates all
+parseable jobs as drafts. It prints the total count, complete schedule, and
+every blocking issue. No job is approved by this command.
+
+Review the current workbook and stored draft together:
+
+```powershell
+python -m weibo_publisher batch-report BATCH_ID
+```
+
+The report re-reads the workbook each time. It checks text, all 18 image
+columns, visibility, Beijing publish time, image existence and size, detected
+file format, duplicate text or image references, internal body time, and the
+240-second local spacing rule.
+
+Approve the entire validated batch atomically:
+
+```powershell
+python -m weibo_publisher batch-confirm BATCH_ID --yes
+```
+
+The command revalidates the workbook and refuses approval if the source changed
+after import or any blocking issue remains. Approval succeeds only when every
+job in the batch can transition from draft to approved. The job-level
+`confirm` command cannot approve batch jobs individually.
+
+If a blocking issue is fixed in the workbook, replace the existing draft batch:
+
+```powershell
+python -m weibo_publisher batch-import `
+  --file "D:\path\weibo-batch.xlsx" `
+  --date 2026-11-11 `
+  --replace
+```
+
+List imported batches with:
+
+```powershell
+python -m weibo_publisher batch-list
+```
+
+Before any job has entered preparation or been published, cancel the remaining
+jobs with:
+
+```powershell
+python -m weibo_publisher batch-cancel BATCH_ID --yes
+```
+
+All publication still runs through the same single runner and dedicated
+profile. Batch jobs use a shared serial execution lock. While one job holds the
+browser, no other job can open the same profile.
+
+If login expires, a captcha appears, or Weibo shows a verification or
+rate-limit response, the runner halts and the batch becomes `paused`. Confirm
+the account state manually, then use `batch-resume BATCH_ID --yes` only after
+the current source still validates. An interrupted preparation or ambiguous
+submission is not retried automatically.
+
 ## Preview
 
 ```powershell

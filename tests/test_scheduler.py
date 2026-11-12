@@ -12,13 +12,21 @@ import pytest
 from weibo_publisher.config import AppConfig
 from weibo_publisher.models import (
     AttemptOutcome,
+    Batch,
+    BatchStatus,
     Job,
     JobStatus,
     PublishResult,
     Visibility,
 )
+from weibo_publisher.publisher import PublisherSafetyStop
 from weibo_publisher.repository import JobRepository
-from weibo_publisher.scheduler import JobExecutor, Runner, RunnerLockError
+from weibo_publisher.scheduler import (
+    JobExecutor,
+    Runner,
+    RunnerHalt,
+    RunnerLockError,
+)
 from weibo_publisher.validation import build_fingerprint
 
 
@@ -112,6 +120,47 @@ def repository_with(config: AppConfig, *jobs: Job) -> JobRepository:
     repo.initialize()
     for job in jobs:
         repo.create_job(job)
+    return repo
+
+
+def approved_batch_with(
+    config: AppConfig,
+    job: Job,
+) -> JobRepository:
+    repo = repository_with(config)
+    batch_id = "batch-1"
+    job.status = JobStatus.DRAFT
+    job.batch_id = batch_id
+    job.source_row = 9
+    job.source_sequence = "001"
+    job.source_fingerprint = "source-1"
+    batch = Batch(
+        id=batch_id,
+        name="Batch",
+        source_path=Path("C:/batch.xlsx"),
+        source_fingerprint="batch-source",
+        local_date=job.publish_at_utc.astimezone(
+            ZoneInfo(job.timezone)
+        ).date(),
+        timezone=job.timezone,
+        status=BatchStatus.DRAFT,
+        created_at=datetime.now(UTC),
+    )
+    repo.create_batch(batch, [job])
+    fingerprint = build_fingerprint(
+        job.text,
+        job.images,
+        job.publish_at_utc,
+        job.visibility,
+    )
+    repo.confirm_batch(
+        batch_id,
+        {job.id: fingerprint},
+        datetime.now(UTC),
+        daily_limit=100,
+        minimum_gap_seconds=240,
+        allow_over_limit=False,
+    )
     return repo
 
 
@@ -694,6 +743,27 @@ async def test_scan_ignores_draft_jobs(app_config: AppConfig) -> None:
 
 
 @pytest.mark.asyncio
+async def test_scan_skips_jobs_from_paused_batch(
+    app_config: AppConfig,
+) -> None:
+    job = approved_job(seconds_from_now=600)
+    repo = approved_batch_with(app_config, job)
+    repo.pause_batch("batch-1", "verification required")
+    calls: list[str] = []
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=lambda job_id: calls.append(job_id),
+    )
+    await runner.scan_once()
+
+    assert calls == []
+    assert runner.scheduled == set()
+
+
+@pytest.mark.asyncio
 async def test_scan_schedules_approved_job_once(
     app_config: AppConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -844,6 +914,66 @@ async def test_scan_removes_job_that_is_no_longer_approved(
 
 
 @pytest.mark.asyncio
+async def test_runner_serializes_executor_callbacks(
+    app_config: AppConfig,
+) -> None:
+    repo = repository_with(app_config)
+    active = 0
+    maximum_active = 0
+
+    def factory(job_id: str):
+        del job_id
+
+        async def callback() -> None:
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+
+        return callback()
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=factory,
+    )
+
+    await asyncio.gather(
+        runner._executor("job-1")(),
+        runner._executor("job-2")(),
+    )
+
+    assert maximum_active == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_captures_halt_signal(
+    app_config: AppConfig,
+) -> None:
+    repo = repository_with(app_config)
+
+    def factory(job_id: str):
+        del job_id
+
+        async def callback() -> None:
+            raise RunnerHalt("verification required")
+
+        return callback()
+
+    runner = Runner(
+        app_config,
+        repo,
+        lambda: FakePublisher(),
+        executor_factory=factory,
+    )
+    await runner._executor("job-1")()
+
+    assert runner.halted_reason == "verification required"
+
+
+@pytest.mark.asyncio
 async def test_callback_failure_allows_later_scan_to_reschedule_approved_job(
     app_config: AppConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -887,6 +1017,48 @@ async def test_callback_failure_allows_later_scan_to_reschedule_approved_job(
 
     assert len(added) == 2
     assert runner.scheduled == {"job-1"}
+
+
+@pytest.mark.asyncio
+async def test_publisher_safety_stop_pauses_batch_and_requires_attention(
+    app_config: AppConfig,
+) -> None:
+    job = approved_job(seconds_from_now=60)
+    repo = approved_batch_with(app_config, job)
+    fake = FakePublisher(
+        prepare_error=PublisherSafetyStop("Weibo verification required"),
+    )
+
+    with pytest.raises(RunnerHalt, match="verification"):
+        await JobExecutor(app_config, repo, lambda: fake).execute(job.id)
+
+    stored = repo.get_job(job.id)
+    assert stored is not None
+    assert stored.status is JobStatus.NEEDS_ATTENTION
+    assert repo.get_batch("batch-1").status is BatchStatus.PAUSED
+
+
+@pytest.mark.asyncio
+async def test_unknown_batch_submission_pauses_batch(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = approved_job(seconds_from_now=60)
+    repo = approved_batch_with(app_config, job)
+    fake = FakePublisher(
+        PublishResult(outcome=AttemptOutcome.UNKNOWN, error="response timeout")
+    )
+
+    async def skip_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr("weibo_publisher.scheduler.asyncio.sleep", skip_sleep)
+
+    with pytest.raises(RunnerHalt, match="response timeout"):
+        await JobExecutor(app_config, repo, lambda: fake).execute(job.id)
+
+    assert repo.get_job(job.id).status is JobStatus.UNKNOWN
+    assert repo.get_batch("batch-1").status is BatchStatus.PAUSED
 
 
 def test_runner_acquires_persistent_lock_with_no_os_lock(

@@ -33,6 +33,35 @@ async def test_composer_region_uses_common_ancestor_for_visibility_selection() -
 
 
 @pytest.mark.asyncio
+async def test_composer_region_allows_tall_image_expanded_shell() -> None:
+    async with _local_page(
+        """
+        <!doctype html>
+        <html>
+          <body>
+            <header><a class="gn_name" href="/u/123">Account</a></header>
+            <main id="composer-shell" style="width:640px">
+              <textarea
+                id="body"
+                placeholder="分享新鲜事"
+                style="height:144px;width:100%"
+              ></textarea>
+              <div style="height:450px">nine image previews</div>
+              <button id="visibility" type="button">公开</button>
+              <button id="publish" type="button">发送</button>
+            </main>
+          </body>
+        </html>
+        """
+    ) as page:
+        composer = await weibo.first_visible(page, weibo.TEXT_SELECTORS)
+        region = await weibo._active_composer_region(composer)
+
+        assert await region.get_attribute("id") == "composer-shell"
+        assert await page.evaluate("window.publishClickCount ?? 0") == 0
+
+
+@pytest.mark.asyncio
 async def test_prepare_page_uses_three_branch_common_ancestor(
     tmp_path: Path,
 ) -> None:

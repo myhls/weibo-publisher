@@ -12,6 +12,7 @@ license = {text = "MIT"}
 dependencies = [
     "playwright>=1.52",
     "apscheduler>=3.10,<4",
+    "openpyxl>=3.1,<4",
 ]
 
 [project.optional-dependencies]

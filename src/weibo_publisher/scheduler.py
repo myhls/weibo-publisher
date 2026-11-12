@@ -21,7 +21,7 @@ from weibo_publisher.models import (
     PublishResult,
     Visibility,
 )
-from weibo_publisher.publisher import Publisher
+from weibo_publisher.publisher import Publisher, PublisherSafetyStop
 from weibo_publisher.repository import JobRepository
 from weibo_publisher.validation import build_fingerprint, validate_images
 
@@ -30,6 +30,10 @@ LOCK_BYTE_COUNT = 1
 
 
 class RunnerLockError(RuntimeError):
+    pass
+
+
+class RunnerHalt(RuntimeError):
     pass
 
 
@@ -48,6 +52,8 @@ class JobExecutor:
         job = self.repo.get_job(job_id)
         if job is None:
             return
+        if job.batch_id and not self.repo.batch_is_runnable(job.batch_id):
+            return
 
         cutoff = job.publish_at_utc + timedelta(
             seconds=self.config.late_cutoff_seconds
@@ -62,6 +68,8 @@ class JobExecutor:
                     "Job was too late: target time passed before preparation started"
                 ),
             )
+            if job.batch_id:
+                self.repo.complete_batch_if_terminal(job.batch_id)
             return
 
         started_at = datetime.now(UTC)
@@ -86,6 +94,9 @@ class JobExecutor:
                 JobStatus.NEEDS_ATTENTION,
                 last_error=str(exc),
             )
+            if job.batch_id:
+                self.repo.pause_batch(job.batch_id, str(exc))
+                raise RunnerHalt(str(exc)) from exc
             return
 
         publisher: Publisher | None = None
@@ -115,6 +126,8 @@ class JobExecutor:
                     AttemptOutcome.REHEARSED.value,
                     None,
                 )
+                if job.batch_id:
+                    self.repo.complete_batch_if_terminal(job.batch_id)
                 return
             if not self.repo.transition(
                 job_id,
@@ -142,6 +155,8 @@ class JobExecutor:
                     AttemptOutcome.INTERRUPTED.value,
                     "Job became too late after publisher preparation",
                 )
+                if job.batch_id:
+                    self.repo.complete_batch_if_terminal(job.batch_id)
                 return
 
             if not self.repo.transition(
@@ -159,6 +174,18 @@ class JobExecutor:
             submit_started = True
             result = await publisher.submit(job, artifact_dir)
             self._record_result(job_id, attempt_id, result)
+            if result.halt_runner or (
+                result.outcome is AttemptOutcome.UNKNOWN and job.batch_id
+            ):
+                self._pause_batch(
+                    job,
+                    result.error or "Publisher requires human attention",
+                )
+                raise RunnerHalt(
+                    result.error or "Publisher halted for human attention"
+                )
+            if job.batch_id:
+                self.repo.complete_batch_if_terminal(job.batch_id)
         except asyncio.CancelledError:
             if attempt_recorded:
                 if submit_started:
@@ -186,7 +213,13 @@ class JobExecutor:
                         "Execution was cancelled before submission started",
                     )
             raise
-        except Exception as exc:  # noqa: BLE001 - submit failures must stop retries
+        except PublisherSafetyStop as exc:
+            self._record_safety_stop(job_id, attempt_id, exc)
+            self._pause_batch(job, str(exc))
+            raise RunnerHalt(str(exc)) from exc
+        except RunnerHalt:
+            raise
+        except Exception as exc:
             if submit_started:
                 self.repo.transition(
                     job_id,
@@ -211,9 +244,45 @@ class JobExecutor:
                 outcome = AttemptOutcome.FAILED
             if attempt_recorded:
                 self.repo.finish_attempt(attempt_id, outcome.value, str(exc))
+            if job.batch_id:
+                self.repo.pause_batch(job.batch_id, str(exc))
+                raise RunnerHalt(str(exc)) from exc
         finally:
             if publisher is not None:
                 await publisher.close()
+
+    def _record_safety_stop(
+        self,
+        job_id: str,
+        attempt_id: str,
+        error: Exception,
+    ) -> None:
+        current = self.repo.get_job(job_id)
+        if current is None:
+            return
+        if current.status is JobStatus.PUBLISHING:
+            self.repo.transition(
+                job_id,
+                {JobStatus.PUBLISHING},
+                JobStatus.FAILED,
+                last_error=str(error),
+            )
+            outcome = AttemptOutcome.FAILED
+        elif current.status in {JobStatus.PREPARING, JobStatus.READY}:
+            self.repo.transition(
+                job_id,
+                {JobStatus.PREPARING, JobStatus.READY},
+                JobStatus.NEEDS_ATTENTION,
+                last_error=str(error),
+            )
+            outcome = AttemptOutcome.INTERRUPTED
+        else:
+            return
+        self.repo.finish_attempt(attempt_id, outcome.value, str(error))
+
+    def _pause_batch(self, job: Job, error: str) -> None:
+        if job.batch_id:
+            self.repo.pause_batch(job.batch_id, error)
 
     def _validate_preparation(self, job: Job) -> None:
         if job.visibility not in {Visibility.PUBLIC, Visibility.PRIVATE}:
@@ -320,6 +389,8 @@ class Runner:
         self.scheduled = self._scheduled_job_ids
         self._lock_path = config.runtime_dir / "runner.lock"
         self._lock_file: BinaryIO | None = None
+        self._publish_lock = asyncio.Lock()
+        self.halted_reason: str | None = None
 
     def acquire_lock(self) -> None:
         if self._lock_file is not None:
@@ -401,9 +472,16 @@ class Runner:
                 pass
 
     async def scan_once(self) -> None:
-        approved_jobs = {
-            job.id: job for job in self.repo.list_jobs(JobStatus.APPROVED)
-        }
+        if self.halted_reason is not None:
+            self._remove_inactive_jobs({})
+            return
+        approved_jobs = {}
+        for job in self.repo.list_jobs(JobStatus.APPROVED):
+            if (
+                job.batch_id is None
+                or self.repo.batch_is_runnable(job.batch_id)
+            ):
+                approved_jobs[job.id] = job
         self._remove_inactive_jobs(approved_jobs)
 
         now = self._now()
@@ -420,6 +498,8 @@ class Runner:
                         "Job was too late: target time passed before preparation started"
                     ),
                 )
+                if job.batch_id:
+                    self.repo.complete_batch_if_terminal(job.batch_id)
                 continue
 
             prepare_at = job.publish_at_utc - timedelta(
@@ -452,6 +532,8 @@ class Runner:
                 AttemptOutcome.UNKNOWN.value,
                 publishing_error,
             )
+            if job.batch_id:
+                self.repo.pause_batch(job.batch_id, publishing_error)
 
         message = (
             "Runner restarted after browser preparation; "
@@ -470,6 +552,8 @@ class Runner:
                     AttemptOutcome.INTERRUPTED.value,
                     message,
                 )
+                if job.batch_id:
+                    self.repo.pause_batch(job.batch_id, message)
 
     async def run_forever(
         self,
@@ -485,9 +569,13 @@ class Runner:
                 started = on_started()
                 if inspect.isawaitable(started):
                     await started
-            while stop_event is None or not stop_event.is_set():
+            while (
+                (stop_event is None or not stop_event.is_set())
+                and self.halted_reason is None
+            ):
                 await self.scan_once()
-                await self.sleep(SCAN_INTERVAL_SECONDS)
+                if self.halted_reason is None:
+                    await self.sleep(SCAN_INTERVAL_SECONDS)
         finally:
             try:
                 try:
@@ -513,12 +601,10 @@ class Runner:
         if self.executor_factory is not None:
 
             async def injected() -> None:
-                try:
-                    callback = self.executor_factory(job_id)
-                    if inspect.isawaitable(callback):
-                        await callback
-                finally:
-                    self._scheduled_job_ids.discard(job_id)
+                await self._run_guarded(
+                    job_id,
+                    lambda: self.executor_factory(job_id),
+                )
 
             return injected
 
@@ -529,12 +615,26 @@ class Runner:
         )
 
         async def execute_job() -> None:
-            try:
-                await executor.execute(job_id)
-            finally:
-                self._scheduled_job_ids.discard(job_id)
+            await self._run_guarded(
+                job_id,
+                lambda: executor.execute(job_id),
+            )
 
         return execute_job
+
+    async def _run_guarded(self, job_id: str, callback_factory) -> None:
+        async with self._publish_lock:
+            if self.halted_reason is not None:
+                self._scheduled_job_ids.discard(job_id)
+                return
+            try:
+                callback = callback_factory()
+                if inspect.isawaitable(callback):
+                    await callback
+            except RunnerHalt as exc:
+                self.halted_reason = str(exc)
+            finally:
+                self._scheduled_job_ids.discard(job_id)
 
     def _now(self) -> datetime:
         now = self.clock()

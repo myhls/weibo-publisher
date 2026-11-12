@@ -85,6 +85,18 @@ def test_parse_error_response() -> None:
     assert "发布失败" in result.error
 
 
+def test_parse_risk_control_response_requires_runner_halt() -> None:
+    result = parse_publish_response(
+        {
+            "code": 100001,
+            "msg": "当前操作过于频繁，请稍后再试",
+        }
+    )
+
+    assert result.outcome is AttemptOutcome.FAILED
+    assert result.halt_runner is True
+
+
 @pytest.mark.parametrize(
     "payload",
     [

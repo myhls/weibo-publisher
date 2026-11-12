@@ -2,15 +2,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from weibo_publisher.batch import (
+    BatchAnalysis,
+    BatchFormatError,
+    analyze_workbook,
+    build_draft_jobs,
+    parse_local_date,
+)
 from weibo_publisher.config import ensure_runtime_dirs, load_config
 from weibo_publisher.logging_setup import configure_logging
-from weibo_publisher.models import Job, JobStatus, Visibility
+from weibo_publisher.models import (
+    Batch,
+    BatchStatus,
+    Job,
+    JobStatus,
+    Visibility,
+)
 from weibo_publisher.repository import ConfirmationError, JobRepository
 from weibo_publisher.scheduler import Runner, RunnerLockError
 from weibo_publisher.validation import (
@@ -97,6 +111,70 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fill a draft or approved job in Weibo without publishing.",
     )
     preview.add_argument("job_id")
+
+    batch_import = subparsers.add_parser(
+        "batch-import",
+        help="Validate a batch workbook and create draft jobs without approval.",
+    )
+    batch_import.add_argument("--file", type=Path, required=True)
+    batch_import.add_argument("--name", default=None)
+    batch_import.add_argument(
+        "--date",
+        required=True,
+        help="Required Beijing local date in YYYY-MM-DD format.",
+    )
+    batch_import.add_argument("--timezone", default=None)
+    batch_import.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace the existing draft batch for the same workbook.",
+    )
+
+    batch_report = subparsers.add_parser(
+        "batch-report",
+        help="Re-read a batch workbook and show its full validation report.",
+    )
+    batch_report.add_argument("batch_id")
+
+    batch_confirm = subparsers.add_parser(
+        "batch-confirm",
+        help="Revalidate and atomically approve one complete draft batch.",
+    )
+    batch_confirm.add_argument("batch_id")
+    batch_confirm.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm approval of every valid job in the batch.",
+    )
+
+    batch_list = subparsers.add_parser("batch-list", help="List imported batches.")
+    batch_list.add_argument(
+        "--status",
+        choices=[item.value for item in BatchStatus],
+        default=None,
+    )
+
+    batch_resume = subparsers.add_parser(
+        "batch-resume",
+        help="Resume a paused batch after its source still validates.",
+    )
+    batch_resume.add_argument("batch_id")
+    batch_resume.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm resumption of the paused batch.",
+    )
+
+    batch_cancel = subparsers.add_parser(
+        "batch-cancel",
+        help="Cancel all not-yet-published jobs in a batch.",
+    )
+    batch_cancel.add_argument("batch_id")
+    batch_cancel.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm cancellation of the batch.",
+    )
 
     subparsers.add_parser(
         "run",
@@ -232,6 +310,10 @@ def _cmd_confirm(args: argparse.Namespace) -> int:
     job = repo.get_job(args.job_id)
     if job is None:
         return _fail(f"job not found: {args.job_id}")
+    if job.batch_id:
+        return _fail(
+            "batch jobs must be approved with batch-confirm, not confirm"
+        )
     if job.status is not JobStatus.DRAFT:
         return _fail(f"job is not a draft: {job.status}")
     if job.visibility not in {Visibility.PUBLIC, Visibility.PRIVATE}:
@@ -276,6 +358,10 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
     job = repo.get_job(args.job_id)
     if job is None:
         return _fail(f"job not found: {args.job_id}")
+    if job.batch_id:
+        return _fail(
+            "batch jobs must be managed through the batch import and confirm flow"
+        )
     if job.status not in {JobStatus.DRAFT, JobStatus.APPROVED}:
         return _fail(f"cannot cancel a {job.status} job")
 
@@ -388,8 +474,366 @@ def _cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _analyze_batch(
+    config,
+    batch: Batch,
+) -> BatchAnalysis:
+    return analyze_workbook(
+        batch.source_path,
+        name=batch.name,
+        local_date=batch.local_date,
+        timezone=batch.timezone,
+        minimum_gap_seconds=config.minimum_gap_seconds,
+        prepare_lead_seconds=config.prepare_lead_seconds,
+        daily_limit=config.daily_limit,
+    )
+
+
+def _batch_source_matches_jobs(
+    analysis: BatchAnalysis,
+    batch: Batch,
+    jobs: list[Job],
+) -> bool:
+    if analysis.source_fingerprint != batch.source_fingerprint:
+        return False
+    if len(analysis.items) != len(jobs):
+        return False
+    by_row = {job.source_row: job for job in jobs}
+    return all(
+        by_row.get(item.source_row) is not None
+        and by_row[item.source_row].source_fingerprint
+        == item.source_fingerprint
+        and by_row[item.source_row].source_sequence == item.sequence
+        for item in analysis.items
+    )
+
+
+def _print_batch_report(
+    analysis: BatchAnalysis,
+    batch: Batch | None,
+    jobs: list[Job] | None = None,
+    *,
+    minimum_gap_seconds: int,
+) -> None:
+    zone = ZoneInfo(analysis.timezone)
+    scheduled = [
+        item.publish_at_utc.astimezone(zone)
+        for item in analysis.items
+        if item.publish_at_utc is not None
+    ]
+    gaps = [
+        int((later - earlier).total_seconds())
+        for earlier, later in itertools.pairwise(scheduled)
+    ]
+    blocking_rows = analysis.blocking_items
+    print(f"Batch: {batch.id if batch else '(not created)'}")
+    print(f"Name: {analysis.name}")
+    print(f"Status: {batch.status.value if batch else 'draft validation'}")
+    print(f"Source: {analysis.source_path}")
+    print(f"Local date: {analysis.local_date.isoformat()} {analysis.timezone}")
+    print(f"Records: {len(analysis.items)}")
+    print(f"Valid records: {len(analysis.valid_items)}")
+    print(f"Records with blocking issues: {len(blocking_rows)}")
+    if scheduled:
+        print(
+            "Schedule: "
+            f"{scheduled[0].strftime('%H:%M')} -> "
+            f"{scheduled[-1].strftime('%H:%M')}"
+        )
+    else:
+        print("Schedule: unavailable")
+    print(
+        "Minimum gap: "
+        f"{min(gaps) if gaps else 'n/a'}s "
+        f"(required: {minimum_gap_seconds}s)"
+    )
+
+    if not _batch_source_matches_jobs(analysis, batch, jobs or []) and batch:
+        print("BLOCKED source: workbook no longer matches the imported draft")
+
+    if analysis.issues:
+        print("Batch anomalies:")
+        for issue in analysis.issues:
+            level = "BLOCK" if issue.blocking else "WARN"
+            print(f"  [{level}] {issue.code}: {issue.message}")
+
+    if blocking_rows:
+        print("Row anomalies:")
+        for item in blocking_rows:
+            print(
+                f"  {item.sequence or '(no sequence)'} "
+                f"row {item.source_row}"
+            )
+            for issue in item.blocking_issues:
+                print(f"    {issue.code}: {issue.message}")
+
+    print("Schedule:")
+    if jobs:
+        jobs_by_row = {job.source_row: job for job in jobs}
+    else:
+        jobs_by_row = {}
+    ordered_items = sorted(
+        analysis.items,
+        key=lambda item: (
+            item.publish_at_utc is None,
+            item.publish_at_utc or datetime.max.replace(tzinfo=UTC),
+            item.source_row,
+        ),
+    )
+    for item in ordered_items:
+        if item.publish_at_utc is None:
+            local_time = "INVALID"
+        else:
+            local_time = item.publish_at_utc.astimezone(zone).strftime("%H:%M")
+        job = jobs_by_row.get(item.source_row)
+        job_status = job.status.value if job is not None else "draft"
+        validation = "OK" if item.valid else "BLOCKED"
+        detail = ""
+        if job is not None and job.weibo_url:
+            detail = f" url={job.weibo_url}"
+        elif job is not None and job.last_error:
+            detail = f" error={job.last_error}"
+        print(
+            f"  {item.sequence or '(none)':>4} "
+            f"row {item.source_row:>3} {local_time} "
+            f"{item.visibility.value if item.visibility else 'invalid':<7} "
+            f"images={len(item.images):>2} "
+            f"{validation:<7} {job_status}{detail}"
+        )
+def _cmd_batch_import(args: argparse.Namespace) -> int:
+    repo, config = _repository_from_args(args)
+    timezone = args.timezone or config.default_timezone
+    try:
+        ZoneInfo(timezone)
+        local_date = parse_local_date(args.date)
+        analysis = analyze_workbook(
+            args.file,
+            name=args.name,
+            local_date=local_date,
+            timezone=timezone,
+            minimum_gap_seconds=config.minimum_gap_seconds,
+            prepare_lead_seconds=config.prepare_lead_seconds,
+            daily_limit=config.daily_limit,
+        )
+    except (BatchFormatError, ZoneInfoNotFoundError) as exc:
+        return _fail(str(exc))
+
+    existing = repo.find_draft_batch_for_source(analysis.source_path)
+    if existing is not None and not args.replace:
+        _print_batch_report(
+            analysis,
+            existing,
+            repo.list_batch_jobs(existing.id),
+            minimum_gap_seconds=config.minimum_gap_seconds,
+        )
+        return _fail(
+            "a draft batch already exists for this workbook; "
+            "rerun with --replace after reviewing changes"
+        )
+
+    if not analysis.can_import:
+        _print_batch_report(
+            analysis,
+            None,
+            minimum_gap_seconds=config.minimum_gap_seconds,
+        )
+        return _fail(
+            "no batch was created because one or more rows lack a valid "
+            "publish time or visibility"
+        )
+
+    batch_id = existing.id if existing is not None else str(uuid.uuid4())
+    batch = Batch(
+        id=batch_id,
+        name=analysis.name,
+        source_path=analysis.source_path,
+        source_fingerprint=analysis.source_fingerprint,
+        local_date=analysis.local_date,
+        timezone=analysis.timezone,
+        status=BatchStatus.DRAFT,
+        created_at=datetime.now(UTC),
+    )
+    jobs = build_draft_jobs(analysis, batch_id)
+    try:
+        if existing is not None:
+            repo.replace_draft_batch(batch, jobs)
+        else:
+            repo.create_batch(batch, jobs)
+    except ConfirmationError as exc:
+        return _fail(str(exc))
+
+    _print_batch_report(
+        analysis,
+        batch,
+        jobs,
+        minimum_gap_seconds=config.minimum_gap_seconds,
+    )
+    print()
+    if analysis.can_confirm:
+        print("Review complete. No jobs were approved.")
+        print(f"Approve the whole batch with: weibo-publisher batch-confirm {batch.id} --yes")
+    else:
+        print("No jobs were approved because blocking anomalies remain.")
+        print("Fix the workbook, rerun batch-import --replace, then report again.")
+    return 0
+
+
+def _cmd_batch_report(args: argparse.Namespace) -> int:
+    repo, config = _repository_from_args(args)
+    batch = repo.get_batch(args.batch_id)
+    if batch is None:
+        return _fail(f"batch not found: {args.batch_id}")
+    jobs = repo.list_batch_jobs(batch.id)
+    try:
+        analysis = _analyze_batch(config, batch)
+    except (BatchFormatError, ZoneInfoNotFoundError) as exc:
+        return _fail(str(exc))
+    _print_batch_report(
+        analysis,
+        batch,
+        jobs,
+        minimum_gap_seconds=config.minimum_gap_seconds,
+    )
+    return 0
+
+
+def _cmd_batch_confirm(args: argparse.Namespace) -> int:
+    repo, config = _repository_from_args(args)
+    batch = repo.get_batch(args.batch_id)
+    if batch is None:
+        return _fail(f"batch not found: {args.batch_id}")
+    jobs = repo.list_batch_jobs(batch.id)
+    try:
+        analysis = _analyze_batch(config, batch)
+    except (BatchFormatError, ZoneInfoNotFoundError) as exc:
+        return _fail(str(exc))
+    _print_batch_report(
+        analysis,
+        batch,
+        jobs,
+        minimum_gap_seconds=config.minimum_gap_seconds,
+    )
+    if batch.status is not BatchStatus.DRAFT:
+        return _fail(f"batch is not a draft: {batch.status.value}")
+    if not _batch_source_matches_jobs(analysis, batch, jobs):
+        return _fail(
+            "workbook content changed after import; rerun batch-import "
+            "--replace before approving"
+        )
+    if not analysis.can_confirm:
+        return _fail("batch has blocking validation issues")
+    if not args.yes:
+        return _fail(
+            "explicit whole-batch confirmation was not provided; "
+            "rerun with --yes after reviewing the report"
+        )
+
+    try:
+        fingerprints = {
+            job.id: build_fingerprint(
+                job.text,
+                job.images,
+                job.publish_at_utc,
+                job.visibility,
+            )
+            for job in jobs
+        }
+        repo.confirm_batch(
+            batch.id,
+            fingerprints,
+            datetime.now(UTC),
+            daily_limit=config.daily_limit,
+            minimum_gap_seconds=config.minimum_gap_seconds,
+            allow_over_limit=config.allow_over_limit,
+        )
+    except (ConfirmationError, OSError, ValueError) as exc:
+        return _fail(str(exc))
+
+    print(f"Approved {len(jobs)} jobs in batch {batch.id}")
+    print("Start the runner with: weibo-publisher run")
+    return 0
+
+
+def _cmd_batch_list(args: argparse.Namespace) -> int:
+    repo, _ = _repository_from_args(args)
+    status = BatchStatus(args.status) if args.status else None
+    batches = repo.list_batches(status)
+    print(
+        f"{'ID':36}  {'STATUS':10}  {'DATE':10}  "
+        f"{'JOBS':>4}  {'NAME'}"
+    )
+    for batch in batches:
+        jobs = repo.list_batch_jobs(batch.id)
+        print(
+            f"{batch.id:36}  {batch.status.value:10}  "
+            f"{batch.local_date.isoformat():10}  {len(jobs):4d}  "
+            f"{batch.name}"
+        )
+    return 0
+
+
+def _cmd_batch_resume(args: argparse.Namespace) -> int:
+    repo, config = _repository_from_args(args)
+    batch = repo.get_batch(args.batch_id)
+    if batch is None:
+        return _fail(f"batch not found: {args.batch_id}")
+    jobs = repo.list_batch_jobs(batch.id)
+    try:
+        analysis = _analyze_batch(config, batch)
+    except (BatchFormatError, ZoneInfoNotFoundError) as exc:
+        return _fail(str(exc))
+    _print_batch_report(
+        analysis,
+        batch,
+        jobs,
+        minimum_gap_seconds=config.minimum_gap_seconds,
+    )
+    if batch.status is not BatchStatus.PAUSED:
+        return _fail(f"batch is not paused: {batch.status.value}")
+    if not args.yes:
+        return _fail(
+            "explicit resume confirmation was not provided; rerun with --yes"
+        )
+    if not _batch_source_matches_jobs(analysis, batch, jobs):
+        return _fail(
+            "workbook content changed after import; replace the draft batch "
+            "before resuming"
+        )
+    if not analysis.can_confirm:
+        return _fail("batch has blocking validation issues")
+    try:
+        resumed = repo.resume_batch(batch.id)
+    except ConfirmationError as exc:
+        return _fail(str(exc))
+    print(f"Resumed {len(jobs)} jobs in batch {resumed.id}")
+    return 0
+
+
+def _cmd_batch_cancel(args: argparse.Namespace) -> int:
+    repo, _ = _repository_from_args(args)
+    batch = repo.get_batch(args.batch_id)
+    if batch is None:
+        return _fail(f"batch not found: {args.batch_id}")
+    jobs = repo.list_batch_jobs(batch.id)
+    print(f"Batch: {batch.id}")
+    print(f"Status: {batch.status.value}")
+    print(f"Jobs: {len(jobs)}")
+    if not args.yes:
+        return _fail(
+            "explicit cancellation confirmation was not provided; "
+            "rerun with --yes"
+        )
+    try:
+        cancelled = repo.cancel_batch(batch.id)
+    except ConfirmationError as exc:
+        return _fail(str(exc))
+    print(f"Cancelled batch {cancelled.id}")
+    return 0
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     started = False
+    runner: Runner | None = None
 
     def report_started() -> None:
         nonlocal started
@@ -421,6 +865,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print("error: runner failed to start")
         return 1
 
+    halted_reason = getattr(runner, "halted_reason", None)
+    if halted_reason:
+        print(f"error: publishing halted: {halted_reason}")
+        return 1
     print("Runner stopped.")
     return 0
 
@@ -438,6 +886,12 @@ def main(argv: list[str] | None = None) -> int:
         "cancel": _cmd_cancel,
         "status": _cmd_status,
         "preview": _cmd_preview,
+        "batch-import": _cmd_batch_import,
+        "batch-report": _cmd_batch_report,
+        "batch-confirm": _cmd_batch_confirm,
+        "batch-list": _cmd_batch_list,
+        "batch-resume": _cmd_batch_resume,
+        "batch-cancel": _cmd_batch_cancel,
         "run": _cmd_run,
     }
     return handlers[args.command](args)

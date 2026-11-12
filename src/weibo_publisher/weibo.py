@@ -20,6 +20,7 @@ from weibo_publisher.browser import (
 )
 from weibo_publisher.config import AppConfig
 from weibo_publisher.models import AttemptOutcome, Job, PublishResult, Visibility
+from weibo_publisher.publisher import PublisherSafetyStop
 from weibo_publisher.validation import normalize_text, validate_images
 
 if TYPE_CHECKING:
@@ -720,6 +721,20 @@ class WeiboPublisher:
 
         page = self.page
         try:
+            session_valid = await _wait_for_session(
+                page,
+                _SESSION_WAIT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise PublisherSafetyStop(
+                "Weibo session could not be verified before submission"
+            ) from exc
+        if not session_valid:
+            raise PublisherSafetyStop(
+                "Weibo session is invalid or requires verification before "
+                "submission"
+            )
+        try:
             images = validate_images(job.images)
             if job.visibility not in {Visibility.PUBLIC, Visibility.PRIVATE}:
                 raise RuntimeError("followers visibility is not supported yet")
@@ -827,7 +842,7 @@ async def _prepare_page(
         timeout=_NAVIGATION_TIMEOUT_MS,
     )
     if not await _wait_for_session(page, _SESSION_WAIT_TIMEOUT_SECONDS):
-        raise RuntimeError(
+        raise PublisherSafetyStop(
             "Weibo session is not valid or requires verification; run login first"
         )
 
@@ -931,6 +946,14 @@ async def _has_nearby_publish_control(
                     return false;
                   }
                   const composerRect = composer.getBoundingClientRect();
+                  const rootRect = root.getBoundingClientRect();
+                  if (
+                    rootRect.height <= 0 ||
+                    rootRect.height >
+                      Math.max(1200, composerRect.height * 6)
+                  ) {
+                    return false;
+                  }
                   for (const control of root.querySelectorAll(
                     'button, a, [role="button"], [class*="submit"]',
                   )) {
@@ -943,15 +966,11 @@ async def _has_nearby_publish_control(
                       continue;
                     }
                     const rect = control.getBoundingClientRect();
-                    const centerX = rect.left + rect.width / 2;
-                    const centerY = rect.top + rect.height / 2;
-                    const composerCenterX =
-                      composerRect.left + composerRect.width / 2;
-                    const composerCenterY =
-                      composerRect.top + composerRect.height / 2;
                     if (
-                      Math.abs(centerX - composerCenterX) <= 700 &&
-                      Math.abs(centerY - composerCenterY) <= 300
+                      rect.right >= rootRect.left &&
+                      rect.left <= rootRect.right &&
+                      rect.bottom >= rootRect.top &&
+                      rect.top <= rootRect.bottom
                     ) {
                       return true;
                     }
@@ -989,9 +1008,11 @@ def parse_publish_response(payload: dict) -> PublishResult:
     ok = payload.get("ok")
 
     if _is_ok_failure(ok) or (raw_code and raw_code != "100000"):
+        message = _response_message(payload)
         return PublishResult(
             outcome=AttemptOutcome.FAILED,
-            error=_response_message(payload),
+            error=message,
+            halt_runner=_response_requires_human_attention(message),
         )
 
     ok_success = _is_ok_success(ok)
@@ -1044,6 +1065,25 @@ def _response_message(payload: dict) -> str:
     if message is None or not str(message).strip():
         return "Weibo rejected the publish request"
     return str(message)
+
+
+def _response_requires_human_attention(message: str) -> bool:
+    normalized = message.casefold()
+    markers = (
+        "验证码",
+        "安全验证",
+        "身份验证",
+        "访问过于频繁",
+        "操作过于频繁",
+        "请求过于频繁",
+        "登录",
+        "风控",
+        "captcha",
+        "verification",
+        "rate limit",
+        "too frequent",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _post_id_from_payload(payload: dict) -> str | None:

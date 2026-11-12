@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -18,6 +18,14 @@ class JobStatus(StrEnum):
     FAILED = "failed"
     UNKNOWN = "unknown"
     MISSED = "missed"
+    CANCELLED = "cancelled"
+
+
+class BatchStatus(StrEnum):
+    DRAFT = "draft"
+    APPROVED = "approved"
+    PAUSED = "paused"
+    COMPLETED = "completed"
     CANCELLED = "cancelled"
 
 
@@ -54,6 +62,24 @@ class Job:
     last_error: str | None = None
     artifact_dir: Path | None = None
     rehearsal: bool = False
+    batch_id: str | None = None
+    source_row: int | None = None
+    source_sequence: str | None = None
+    source_fingerprint: str | None = None
+
+
+@dataclass(slots=True)
+class Batch:
+    id: str
+    name: str
+    source_path: Path
+    source_fingerprint: str
+    local_date: date
+    timezone: str
+    status: BatchStatus
+    created_at: datetime
+    approved_at: datetime | None = None
+    last_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -62,6 +88,7 @@ class PublishResult:
     weibo_mid: str | None = None
     weibo_url: str | None = None
     error: str | None = None
+    halt_runner: bool = False
 
 
 _TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
